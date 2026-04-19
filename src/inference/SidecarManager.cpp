@@ -16,73 +16,90 @@ SidecarManager::~SidecarManager()
 int SidecarManager::pickFreePort()
 {
     juce::Random r((juce::int64) juce::Time::getHighResolutionTicks());
-    return 49152 + r.nextInt(65535 - 49152);
+    return 49152 + r.nextInt(16383);
+}
+
+bool SidecarManager::isRunning() const
+{
+#if JUCE_WINDOWS
+    if (m_hProcess == nullptr) return false;
+    DWORD code = STILL_ACTIVE;
+    ::GetExitCodeProcess(static_cast<HANDLE>(m_hProcess), &code);
+    return code == STILL_ACTIVE;
+#else
+    return m_running.load();
+#endif
 }
 
 bool SidecarManager::launch(const Config& cfg)
 {
-    // Called from a background thread - all blocking I/O is fine here.
+    // Called from HttpSidecarBackend's background thread -- safe to block here.
     m_lastError.clear();
     m_launchTimeMs = juce::Time::currentTimeMillis();
 
     if (! cfg.sidecarExecutable.existsAsFile()) {
-        m_lastError = "Sidecar not found at:\n" + cfg.sidecarExecutable.getFullPathName();
-        if (onLogLine) onLogLine("[Sidecar] " + m_lastError);
+        m_lastError = "Sidecar not found:\n" + cfg.sidecarExecutable.getFullPathName()
+                    + "\n\nReinstall the plugin.";
+        if (onLogLine) onLogLine("[Sidecar] ERROR: " + m_lastError);
         return false;
     }
 
     cfg.modelDirectory.createDirectory();
-    m_sidecarPath = cfg.sidecarExecutable.getFullPathName();
     m_port = (cfg.port > 0) ? cfg.port : pickFreePort();
+    m_sidecarPath = cfg.sidecarExecutable.getFullPathName();
 
-    auto workingDir = cfg.sidecarExecutable.getParentDirectory();
+    const auto workingDir = cfg.sidecarExecutable.getParentDirectory().getFullPathName();
 
-    if (onLogLine) {
-        onLogLine("[Sidecar] Launching: " + m_sidecarPath);
-        onLogLine("[Sidecar] Port: " + juce::String(m_port));
-        onLogLine("[Sidecar] Model dir: " + cfg.modelDirectory.getFullPathName());
-    }
+    if (onLogLine) onLogLine("[Sidecar] Launching: " + m_sidecarPath
+        + "  port=" + juce::String(m_port));
 
-   #if JUCE_WINDOWS
-    // Use CreateProcess directly so we can:
-    // 1. Set working directory without mutating global CWD
-    // 2. Get a real HANDLE for Job Object assignment
-    // 3. Set up stdout/stderr pipes ourselves
+#if JUCE_WINDOWS
+    // Create anonymous pipe for stdout/stderr
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
 
-    HANDLE hStdoutRead = nullptr, hStdoutWrite = nullptr;
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-    if (! ::CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0)) {
-        m_lastError = "Failed to create stdout pipe.";
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (! ::CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        m_lastError = "CreatePipe failed (" + juce::String((int)::GetLastError()) + ")";
         if (onLogLine) onLogLine("[Sidecar] " + m_lastError);
         return false;
     }
-    ::SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si = {};
-    si.cb          = sizeof(si);
-    si.hStdOutput  = hStdoutWrite;
-    si.hStdError   = hStdoutWrite;
-    si.dwFlags     = STARTF_USESTDHANDLES;
+    // Make read end non-inheritable
+    ::SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
 
     juce::String cmdLine = "\"" + m_sidecarPath + "\""
         + " --port " + juce::String(m_port)
         + " --model-dir \"" + cfg.modelDirectory.getFullPathName() + "\"";
 
+    STARTUPINFOW si = {};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES;
+    si.hStdOutput  = hWrite;
+    si.hStdError   = hWrite;
+    si.hStdInput   = ::GetStdHandle(STD_INPUT_HANDLE);
+
     PROCESS_INFORMATION pi = {};
-    auto cmdW = cmdLine.toWideCharPointer();
-    auto cwdW = workingDir.getFullPathName().toWideCharPointer();
 
-    BOOL created = ::CreateProcessW(
-        nullptr, const_cast<LPWSTR>(cmdW),
-        nullptr, nullptr, TRUE,   // bInheritHandles = TRUE for pipe
-        CREATE_NO_WINDOW,
-        nullptr, cwdW, &si, &pi);
+    // Use a mutable buffer for lpCommandLine (Windows requirement)
+    std::vector<wchar_t> cmdBuf(cmdLine.toWideCharPointer(),
+                                cmdLine.toWideCharPointer() + cmdLine.length() + 1);
 
-    // Close the write end in our process immediately - the child owns it now
-    ::CloseHandle(hStdoutWrite);
+    BOOL ok = ::CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr, nullptr,
+        TRUE,                    // inherit handles (pipe)
+        CREATE_NO_WINDOW,        // no console window
+        nullptr,
+        workingDir.toWideCharPointer(),
+        &si, &pi);
 
-    if (! created) {
-        ::CloseHandle(hStdoutRead);
+    // Close child's write end immediately - we only read
+    ::CloseHandle(hWrite);
+
+    if (! ok) {
+        ::CloseHandle(hRead);
         m_lastError = "CreateProcess failed (error " + juce::String((int)::GetLastError()) + ").\n"
                     "Antivirus may be blocking sidecar.exe.";
         if (onLogLine) onLogLine("[Sidecar] " + m_lastError);
@@ -90,174 +107,100 @@ bool SidecarManager::launch(const Config& cfg)
     }
 
     ::CloseHandle(pi.hThread);
-    m_processHandle = pi.hProcess;
-    m_stdoutRead    = hStdoutRead;
+    m_hProcess  = pi.hProcess;
+    m_hStdoutRd = hRead;
 
-    // Create Job Object and assign process so it dies when plugin unloads
-    auto job = ::CreateJobObjectW(nullptr, nullptr);
+    // Attach to Job Object so sidecar dies if DAW crashes
+    HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
     if (job) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION ji = {};
+        ji.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &ji, sizeof(ji));
         ::AssignProcessToJobObject(job, pi.hProcess);
-        m_jobHandle = job;
+        m_hJob = job;
     }
 
     if (onLogLine) onLogLine("[Sidecar] Process spawned (PID "
-        + juce::String((int)pi.dwProcessId) + ")");
+        + juce::String((int)pi.dwProcessId) + "), reading stdout...");
 
-    m_readySeen    = false;
-    m_crashChecked = false;
-
-    // Drain stdout on a dedicated thread - never on the message thread.
-    // readProcessOutput busy-loops on Windows when no output is available,
-    // which would peg CPU and starve the DAW's message thread.
-    m_stdoutThread = std::thread([this]() { drainStdout(); });
-
-    // Use a lightweight timer just for crash detection (no stdout reads)
-    juce::MessageManager::callAsync([this]() { startTimer(500); });
+    // Launch reader thread - reads pipe blocking, posts lines via callAsync
+    m_running = true;
+    m_readerThread = std::thread([this]() { readerThreadBody(); });
     return true;
 
-   #else
-    // Non-Windows: use JUCE ChildProcess (stdout drained on bg thread too)
-    juce::StringArray args;
-    args.add(m_sidecarPath);
-    args.add("--port"); args.add(juce::String(m_port));
-    args.add("--model-dir"); args.add(cfg.modelDirectory.getFullPathName());
-
-    m_proc = std::make_unique<juce::ChildProcess>();
-    auto savedCwd = juce::File::getCurrentWorkingDirectory();
-    workingDir.setAsCurrentWorkingDirectory();
-    const bool ok = m_proc->start(args,
-        juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr);
-    savedCwd.setAsCurrentWorkingDirectory();
-
-    if (! ok) {
-        m_lastError = "ChildProcess::start failed.";
-        if (onLogLine) onLogLine("[Sidecar] " + m_lastError);
-        m_proc.reset();
-        return false;
-    }
-
-    m_readySeen = false; m_crashChecked = false;
-    m_stdoutThread = std::thread([this]() { drainStdout(); });
-    juce::MessageManager::callAsync([this]() { startTimer(500); });
-    return true;
-   #endif
+#else
+    // Non-Windows stub
+    m_lastError = "SidecarManager only implemented for Windows.";
+    return false;
+#endif
 }
 
-void SidecarManager::drainStdout()
+void SidecarManager::readerThreadBody()
 {
-    // Runs on m_stdoutThread - blocks on ReadFile, never touches message thread.
-    juce::String buf;
+#if JUCE_WINDOWS
+    char buf[1024];
+    juce::String lineBuffer;
 
-   #if JUCE_WINDOWS
-    if (m_stdoutRead == nullptr) return;
-    char chunk[4096];
-    DWORD bytesRead = 0;
-    while (::ReadFile(static_cast<HANDLE>(m_stdoutRead), chunk, sizeof(chunk), &bytesRead, nullptr)
-           && bytesRead > 0)
-    {
-        buf += juce::String(chunk, (size_t) bytesRead);
+    while (true) {
+        DWORD bytesRead = 0;
+        BOOL ok = ::ReadFile(static_cast<HANDLE>(m_hStdoutRd),
+                             buf, sizeof(buf) - 1, &bytesRead, nullptr);
+        if (! ok || bytesRead == 0) break;   // pipe closed or process exited
+
+        buf[bytesRead] = '\0';
+        lineBuffer += juce::String(buf);
+
         int nl;
-        while ((nl = buf.indexOfChar('\n')) >= 0) {
-            auto line = buf.substring(0, nl).trim();
-            buf = buf.substring(nl + 1);
-            if (line.isNotEmpty()) dispatchLine(line);
-        }
-        if (m_stopFlag.load()) break;
-    }
-    // Flush remainder
-    if (buf.trim().isNotEmpty()) dispatchLine(buf.trim());
-    ::CloseHandle(static_cast<HANDLE>(m_stdoutRead));
-    m_stdoutRead = nullptr;
-   #else
-    if (! m_proc) return;
-    char chunk[4096];
-    while (! m_stopFlag.load()) {
-        auto bytes = m_proc->readProcessOutput(chunk, sizeof(chunk));
-        if (bytes <= 0) { juce::Thread::sleep(50); continue; }
-        buf += juce::String(chunk, (size_t) bytes);
-        int nl;
-        while ((nl = buf.indexOfChar('\n')) >= 0) {
-            auto line = buf.substring(0, nl).trim();
-            buf = buf.substring(nl + 1);
-            if (line.isNotEmpty()) dispatchLine(line);
+        while ((nl = lineBuffer.indexOfChar('\n')) >= 0) {
+            auto line = lineBuffer.substring(0, nl).trim();
+            lineBuffer = lineBuffer.substring(nl + 1);
+            if (line.isNotEmpty()) {
+                // Post to message thread -- never block message thread from here
+                juce::MessageManager::callAsync([this, line]() {
+                    if (onLogLine) onLogLine(line);
+                });
+            }
         }
     }
-   #endif
-}
 
-void SidecarManager::dispatchLine(const juce::String& line)
-{
-    if (line == "READY" || line.startsWith("READY ")) {
-        m_readySeen.store(true);
-    }
-    // Post to message thread so onLogLine (which updates UI) is always on msg thread
-    if (onLogLine) {
-        auto cb   = onLogLine;
-        auto copy = line;
-        juce::MessageManager::callAsync([cb, copy]() { cb(copy); });
-    }
+    // Pipe closed -- process exited
+    const auto elapsed = juce::Time::currentTimeMillis() - m_launchTimeMs;
+    DWORD exitCode = 1;
+    if (m_hProcess) ::GetExitCodeProcess(static_cast<HANDLE>(m_hProcess), &exitCode);
+
+    juce::String msg = "[Sidecar] Process exited after " + juce::String(elapsed)
+                     + "ms, code=" + juce::String((int)exitCode);
+    juce::MessageManager::callAsync([this, msg]() {
+        if (onLogLine) onLogLine(msg);
+    });
+#endif
+
+    m_running = false;
 }
 
 void SidecarManager::shutdown()
 {
-    m_stopFlag.store(true);
-    stopTimer();
+    m_running = false;
 
-   #if JUCE_WINDOWS
-    if (m_processHandle != nullptr) {
-        ::TerminateProcess(static_cast<HANDLE>(m_processHandle), 1);
-        ::CloseHandle(static_cast<HANDLE>(m_processHandle));
-        m_processHandle = nullptr;
+#if JUCE_WINDOWS
+    if (m_hProcess != nullptr) {
+        ::TerminateProcess(static_cast<HANDLE>(m_hProcess), 1);
+        ::WaitForSingleObject(static_cast<HANDLE>(m_hProcess), 2000);
+        ::CloseHandle(static_cast<HANDLE>(m_hProcess));
+        m_hProcess = nullptr;
     }
-    if (m_stdoutRead != nullptr) {
-        ::CloseHandle(static_cast<HANDLE>(m_stdoutRead));
-        m_stdoutRead = nullptr;
+    if (m_hStdoutRd != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(m_hStdoutRd));
+        m_hStdoutRd = nullptr;
     }
-    if (m_jobHandle != nullptr) {
-        ::CloseHandle(static_cast<HANDLE>(m_jobHandle));
-        m_jobHandle = nullptr;
+    if (m_hJob != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(m_hJob));
+        m_hJob = nullptr;
     }
-   #endif
+#endif
 
-    if (m_proc) { m_proc->kill(); m_proc.reset(); }
-    if (m_stdoutThread.joinable()) m_stdoutThread.join();
-    m_stopFlag.store(false);
-}
-
-bool SidecarManager::isRunning() const
-{
-   #if JUCE_WINDOWS
-    if (m_processHandle != nullptr) {
-        DWORD code = STILL_ACTIVE;
-        ::GetExitCodeProcess(static_cast<HANDLE>(m_processHandle), &code);
-        return code == STILL_ACTIVE;
-    }
-   #endif
-    return m_proc && m_proc->isRunning();
-}
-
-void SidecarManager::timerCallback()
-{
-    // Only crash detection here - NO stdout reads (those happen on m_stdoutThread).
-    if (isRunning()) return;
-
-    stopTimer();
-
-    if (! m_readySeen.load() && ! m_crashChecked.load()) {
-        m_crashChecked.store(true);
-        const auto elapsed = juce::Time::currentTimeMillis() - m_launchTimeMs;
-        juce::String hint;
-        if      (elapsed < 2000)  hint = "Died under 2s - antivirus likely blocked sidecar.exe.";
-        else if (elapsed < 15000) hint = "Died during startup - missing Python module or CUDA DLL.";
-        else                      hint = "Died during model load - insufficient RAM/VRAM.";
-
-        m_lastError = "Sidecar exited unexpectedly (" + juce::String(elapsed) + "ms).\n\n"
-                    + hint + "\n\nPath: " + m_sidecarPath;
-        if (onLogLine) onLogLine("ERROR " + m_lastError);
-    }
+    if (m_readerThread.joinable())
+        m_readerThread.join();
 }
 
 } // namespace AIMC

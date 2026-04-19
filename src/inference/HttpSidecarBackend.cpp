@@ -68,9 +68,6 @@ void HttpSidecarBackend::start(StatusCallback onStatus)
                          reason.isEmpty() ? juce::String("Failed to launch sidecar process.")
                                           : reason);
         }
-        // SidecarManager owns its own crash-detection timer.
-        // HttpSidecarBackend's healthz timer is a fallback for buffered stdout.
-        juce::MessageManager::callAsync([this]() { startTimer(2000); });
     }).detach();
 }
 
