@@ -28,51 +28,50 @@ void HttpSidecarBackend::start(StatusCallback onStatus)
     m_statusCb = std::move(onStatus);
     updateStatus(Status::Starting, "Launching sidecar...");
 
-    m_sidecar = std::make_unique<SidecarManager>();
+    // Spawn sidecar on a background thread so the DAW message thread
+    // returns instantly. All filesystem I/O and CreateProcess happen there.
+    std::thread([this]() {
+        m_sidecar = std::make_unique<SidecarManager>();
 
-    // Open a log file next to the model dir so we can always inspect
-    // what the sidecar printed, even after the plugin unloads.
-    auto logFile = m_modelDir.getParentDirectory().getChildFile("sidecar.log");
-    logFile.getParentDirectory().createDirectory();
-    logFile.replaceWithText("=== Sidecar log started at "
-        + juce::Time::getCurrentTime().toString(true, true) + " ===\n");
-    m_logFile = logFile;
+        auto logFile = m_modelDir.getParentDirectory().getChildFile("sidecar.log");
+        logFile.getParentDirectory().createDirectory();
+        logFile.replaceWithText("=== Sidecar log started at "
+            + juce::Time::getCurrentTime().toString(true, true) + " ===\n");
+        m_logFile = logFile;
 
-    m_sidecar->onLogLine = [this](const juce::String& line) {
-        // Append EVERY line to log file for postmortem
-        if (m_logFile.existsAsFile())
-            m_logFile.appendText(line + "\n");
+        m_sidecar->onLogLine = [this](const juce::String& line) {
+            if (m_logFile.existsAsFile())
+                m_logFile.appendText(line + "\n");
 
-        // Parse for status changes
-        if (line.startsWith("PROGRESS download ")) {
-            float pct = line.fromFirstOccurrenceOf("PROGRESS download ", false, false).getFloatValue();
-            updateStatus(Status::DownloadingModel, "Downloading model...", pct / 100.f);
-        } else if (line.startsWith("PROGRESS load ")) {
-            float pct = line.fromFirstOccurrenceOf("PROGRESS load ", false, false).getFloatValue();
-            updateStatus(Status::LoadingModel, "Loading model into memory...", pct / 100.f);
-        } else if (line.startsWith("READY")) {
-            updateStatus(Status::Ready, "Model ready.", 1.f);
-        } else if (line.startsWith("ERROR ")) {
-            auto errMsg = line.substring(6);
-            // Append path to log file so user can find full details
-            errMsg << "\n\nFull sidecar log: " << m_logFile.getFullPathName();
-            updateStatus(Status::Failed, errMsg, 0.f);
+            if (line.startsWith("PROGRESS download ")) {
+                float pct = line.fromFirstOccurrenceOf("PROGRESS download ", false, false).getFloatValue();
+                updateStatus(Status::DownloadingModel, "Downloading model...", pct / 100.f);
+            } else if (line.startsWith("PROGRESS load ")) {
+                float pct = line.fromFirstOccurrenceOf("PROGRESS load ", false, false).getFloatValue();
+                updateStatus(Status::LoadingModel, "Loading model into memory...", pct / 100.f);
+            } else if (line.startsWith("READY")) {
+                updateStatus(Status::Ready, "Model ready.", 1.f);
+            } else if (line.startsWith("ERROR ")) {
+                auto errMsg = line.substring(6);
+                errMsg << "\n\nFull sidecar log: " << m_logFile.getFullPathName();
+                updateStatus(Status::Failed, errMsg, 0.f);
+            }
+        };
+
+        SidecarManager::Config cfg;
+        cfg.sidecarExecutable = m_sidecarExe;
+        cfg.modelDirectory    = m_modelDir;
+
+        if (! m_sidecar->launch(cfg)) {
+            auto reason = m_sidecar->lastError();
+            updateStatus(Status::Failed,
+                         reason.isEmpty() ? juce::String("Failed to launch sidecar process.")
+                                          : reason);
         }
-    };
-
-    SidecarManager::Config cfg;
-    cfg.sidecarExecutable = m_sidecarExe;
-    cfg.modelDirectory    = m_modelDir;
-
-    if (! m_sidecar->launch(cfg)) {
-        auto reason = m_sidecar->lastError();
-        updateStatus(Status::Failed,
-                     reason.isEmpty() ? juce::String("Failed to launch sidecar process.")
-                                      : reason);
-        return;
-    }
-
-    startTimer(500);   // periodic /healthz poll
+        // SidecarManager owns its own crash-detection timer.
+        // HttpSidecarBackend's healthz timer is a fallback for buffered stdout.
+        juce::MessageManager::callAsync([this]() { startTimer(2000); });
+    }).detach();
 }
 
 void HttpSidecarBackend::stop()

@@ -6,18 +6,12 @@
 
 namespace AIMC {
 
-/** Top-level plugin processor.
-    - Holds the InferenceBackend (Python sidecar v1).
-    - Holds per-instance ChatHistory.
-    - Caches a "pending MIDI file to emit" for the next processBlock
-      so the user can drag the generated MIDI directly onto the current track. */
 class PluginProcessor : public juce::AudioProcessor
 {
 public:
     PluginProcessor();
     ~PluginProcessor() override;
 
-    // -- Boilerplate -----------------------------------------------------------
     void prepareToPlay(double, int) override {}
     void releaseResources() override {}
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -25,7 +19,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
     const juce::String getName() const override { return "AI MIDI Composer"; }
-    bool acceptsMidi() const override  { return false; }
+    bool acceptsMidi() const override  { return true; }
     bool producesMidi() const override { return true; }
     bool isMidiEffect() const override { return true; }
     double getTailLengthSeconds() const override { return 0.0; }
@@ -37,11 +31,11 @@ public:
     void getStateInformation(juce::MemoryBlock&) override;
     void setStateInformation(const void*, int) override;
 
-    // -- Exposed to editor -----------------------------------------------------
     juce::AudioProcessorValueTreeState& getAPVTS()   { return m_apvts; }
     ChatHistory&       getHistory()                  { return m_history; }
     InferenceBackend*  getBackend()                  { return m_backend.get(); }
     juce::File         getSessionDir() const         { return m_sessionDir; }
+    void               initBackend();
 
 private:
     juce::AudioProcessorValueTreeState m_apvts;
@@ -52,9 +46,6 @@ private:
     void ensureSessionDir();
     juce::File locateBundledSidecar() const;
     juce::File resolveModelCacheDir() const;
-
-    // Address-tag helper: used by locateBundledSidecar to discover the
-    // plugin DLL's path via GetModuleHandleEx. Intentionally does nothing.
     static void locateBundledSidecarAddressTag();
 };
 
