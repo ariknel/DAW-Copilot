@@ -222,15 +222,59 @@ def _generate_midi(prompt: str, temperature: float, top_p: float, max_tokens: in
     # Strip the prompt tokens - keep only newly generated ones
     new_ids = out_ids[0, input_ids.shape[1]:].tolist()
 
-    # Convert model token IDs -> AMT event tuples -> MIDI
-    # AMT MIDI tokens occupy ids >= text_vocab_size (128256 in Llama 3.2)
-    text_vocab_size = 128_256
-    midi_tokens = [t - text_vocab_size for t in new_ids if t >= text_vocab_size]
+    # The model embedding matrix splits at 128256 (per model card: "extends Llama 3.2's
+    # vocabulary of 128,256 tokens"). tokenizer.vocab_size returns 128000 which is the
+    # Llama 3.2 *tokenizer* vocab, but the embedding uses 128256 as the boundary.
+    MIDI_OFFSET = 128_256
+    all_midi = [t - MIDI_OFFSET for t in new_ids if t >= MIDI_OFFSET]
 
-    if not midi_tokens:
-        raise RuntimeError("Model produced no MIDI tokens.")
+    if not all_midi:
+        MIDI_OFFSET = 128_000
+        all_midi = [t - MIDI_OFFSET for t in new_ids if t >= MIDI_OFFSET]
 
-    midi_obj = _MIDI_TOKENIZER(midi_tokens)   # -> mido.MidiFile
+    print(f"[DEBUG] offset={MIDI_OFFSET} generated={len(new_ids)} "
+          f"midi_count={len(all_midi)} "
+          f"min={min(all_midi) if all_midi else 'N/A'} "
+          f"max={max(all_midi) if all_midi else 'N/A'}", flush=True)
+
+    if not all_midi:
+        raise RuntimeError(f"Model produced no MIDI tokens. Sample: {new_ids[:10]}")
+
+    # The anticipation library vocab layout (from vocab.py):
+    #   TIME_OFFSET=0,     valid time tokens:  0 <= t < 10000
+    #   DUR_OFFSET=10000,  valid dur tokens:   10000 <= t < 11000
+    #   NOTE_OFFSET=11000, valid note tokens:  11000 <= t < 27513
+    #   CONTROL_OFFSET=27513 (anticipated tokens, interleaved for infilling)
+    #
+    # The model generates triplets: (time, duration, note) interleaved with
+    # anticipated control tokens. We extract only complete valid triplets.
+    # Build triplets by scanning for valid (time, dur, note) sequences.
+    TIME_MIN, TIME_MAX = 0, 9999
+    DUR_MIN,  DUR_MAX  = 10000, 10999
+    NOTE_MIN, NOTE_MAX = 11000, 27512
+
+    triplets = []
+    i = 0
+    while i < len(all_midi) - 2:
+        t0, t1, t2 = all_midi[i], all_midi[i+1], all_midi[i+2]
+        if (TIME_MIN <= t0 <= TIME_MAX and
+            DUR_MIN  <= t1 <= DUR_MAX  and
+            NOTE_MIN <= t2 <= NOTE_MAX):
+            triplets.extend([t0, t1, t2])
+            i += 3
+        else:
+            i += 1  # skip and rescan
+
+    print(f"[DEBUG] valid triplets extracted: {len(triplets)//3} notes "
+          f"({len(triplets)} tokens)", flush=True)
+
+    if not triplets:
+        raise RuntimeError(
+            f"No valid (time, duration, note) triplets found in {len(all_midi)} tokens. "
+            f"Sample: {all_midi[:15]}"
+        )
+
+    midi_obj = _MIDI_TOKENIZER(triplets)
 
     buf = io.BytesIO()
     midi_obj.save(file=buf)
