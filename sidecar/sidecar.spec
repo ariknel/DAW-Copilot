@@ -1,209 +1,116 @@
-# PyInstaller spec for the AI MIDI Composer sidecar.
-# Build with:  pyinstaller sidecar.spec --clean --noconfirm
-#
-# Strategy: MINIMAL manual collection.
-# torch, numpy, transformers, tokenizers, safetensors all ship their own
-# PyInstaller hooks inside the package. Let those hooks run automatically.
-# We only manually collect packages that LACK built-in hooks.
-
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+# PyInstaller spec for AI MIDI Composer v2 sidecar (ACE-Step 1.5 + Basic Pitch)
 
-datas    = []
-binaries = []
+import sys, os
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_all
+
+block_cipher = None
 hiddenimports = []
+datas = []
+binaries = []
 
-# anticipation: git-installed, no PyInstaller hook, collect fully (small pkg)
+# FastAPI / uvicorn
+hiddenimports += collect_submodules("fastapi")
+hiddenimports += collect_submodules("uvicorn")
+hiddenimports += collect_submodules("starlette")
+hiddenimports += ["anyio", "anyio.backends.asyncio", "anyio.backends.trio"]
+
+# ACE-Step - installed from GitHub, package may be 'ace_step' or 'acestep'
+# Try both names with collect_all (grabs submodules + data + binaries)
+for pkg in ("ace_step", "acestep"):
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d; binaries += b; hiddenimports += h
+        print(f"[spec] collected all from: {pkg}")
+    except Exception as e:
+        print(f"[spec] {pkg} not found: {e}")
+
+# ACE-Step explicit submodule list (belt-and-suspenders)
+for mod in [
+    "acestep.pipeline", "acestep.models", "acestep.inference",
+    "ace_step.pipeline", "ace_step.models", "ace_step.inference",
+    "diffusers", "accelerate", "transformers",
+    "einops", "loguru", "diskcache",
+]:
+    try:
+        hiddenimports += collect_submodules(mod)
+    except Exception:
+        hiddenimports.append(mod)
+
+# Basic Pitch
 try:
-    d, b, h = collect_all("anticipation")
+    d, b, h = collect_all("basic_pitch")
     datas += d; binaries += b; hiddenimports += h
 except Exception as e:
-    print(f"[spec] anticipation collect failed: {e}")
+    print(f"[spec] basic_pitch: {e}")
 
-# huggingface_hub: needs its metadata/data files for model download to work
+# Audio libs
+for pkg in ("soundfile", "librosa", "audioread", "resampy", "soxr"):
+    try:
+        hiddenimports += collect_submodules(pkg)
+        datas += collect_data_files(pkg)
+    except Exception:
+        pass
+
+# HuggingFace
 try:
+    hiddenimports += collect_submodules("huggingface_hub")
     datas += collect_data_files("huggingface_hub")
-except Exception as e:
-    print(f"[spec] huggingface_hub data failed: {e}")
+except Exception:
+    pass
 
-# accelerate: collect data files for device_map support
-try:
-    datas += collect_data_files("accelerate")
-except Exception as e:
-    print(f"[spec] accelerate data failed: {e}")
+# Diffusers / transformers / accelerate
+for pkg in ("diffusers", "transformers", "accelerate"):
+    try:
+        hiddenimports += collect_submodules(pkg)
+    except Exception:
+        pass
 
-# mido: pure Python, tiny, no hook - just list the submodules explicitly
-hiddenimports += [
-    "mido",
-    "mido.backends",
-    "mido.backends.backend",
-    "mido.messages",
-    "mido.midifiles",
-    "mido.midifiles.midifiles",
-    "mido.midifiles.meta",
-    "mido.midifiles.tracks",
-    "mido.frozen",
-    "mido.ports",
-]
+# Torch (don't collect_all - too large; just mark as hidden)
+hiddenimports += ["torch", "torchaudio"]
 
-# uvicorn: dynamic imports not caught by static analysis
-hiddenimports += [
-    "uvicorn",
-    "uvicorn.logging",
-    "uvicorn.loops.auto",
-    "uvicorn.loops.asyncio",
-    "uvicorn.protocols.http.auto",
-    "uvicorn.protocols.http.h11_impl",
-    "uvicorn.protocols.websockets.auto",
-    "uvicorn.protocols.websockets.wsproto_impl",
-    "uvicorn.lifespan.on",
-    "uvicorn.lifespan.off",
-]
-
-# fastapi/starlette: routers loaded dynamically
-hiddenimports += [
-    "fastapi",
-    "fastapi.responses",
-    "fastapi.routing",
-    "starlette.routing",
-    "starlette.middleware.cors",
-    "starlette.responses",
-    "starlette.staticfiles",
-    "anyio",
-    "anyio._backends._asyncio",
-    "sniffio",
-    "h11",
-    "click",
-]
-
-# psutil: only the Windows backend is needed
-hiddenimports += [
-    "psutil",
-    "psutil._pswindows",
-    "psutil._psutil_windows",
-]
-
-# numpy._core C-extensions that PyInstaller misses via static analysis.
-# These are loaded dynamically inside numpy/__init__.py and are NOT
-# caught by the built-in numpy hook in older PyInstaller versions.
-hiddenimports += [
-    "numpy._core._exceptions",
-    "numpy._core._multiarray_umath",
-    "numpy._core._multiarray_tests",
-    "numpy._core.multiarray",
-    "numpy._core.umath",
-    "numpy._core._operand_flag_tests",
-    "numpy._core._rational_tests",
-    "numpy._core._simd",
-    "numpy._core._struct_ufunc_tests",
-    "numpy._core._umath_tests",
-    "numpy._core.strings",
-    "numpy.random._pickle",
-    "numpy.random._common",
-    "numpy.random._bounded_integers",
-    "numpy.random._mt19937",
-    "numpy.random._philox",
-    "numpy.random._pcg64",
-    "numpy.random._sfc64",
-    "numpy.random._generator",
-]
-
-# accelerate: required for HuggingFace model loading optimizations
-hiddenimports += [
-    "accelerate",
-    "accelerate.utils",
-    "accelerate.utils.modeling",
-]
-
-# sympy: required by torch.fx.experimental.symbolic_shapes -> torch.utils._sympy
-# DO NOT exclude this — torch needs it at model load time.
-hiddenimports += [
-    "sympy",
-    "sympy.core",
-    "sympy.core.numbers",
-    "sympy.core.symbol",
-    "sympy.core.expr",
-    "sympy.core.add",
-    "sympy.core.mul",
-    "sympy.core.power",
-    "sympy.core.relational",
-    "sympy.core.singleton",
-    "sympy.logic",
-    "sympy.logic.boolalg",
-    "sympy.sets",
-    "sympy.sets.sets",
-    "sympy.printing",
-    "sympy.printing.str",
-]
-
-# unittest.mock is imported by torch._dispatch.python at module load time.
-# Even though we excluded unittest tests, the stdlib unittest package itself
-# must be present. PyInstaller normally includes stdlib but excludes can
-# sometimes strip it. Be explicit.
-hiddenimports += [
-    "unittest",
-    "unittest.mock",
-    "unittest.case",
-]
+# Misc
+hiddenimports += ["psutil", "numpy", "scipy", "soundfile", "packaging",
+                  "safetensors", "huggingface_hub"]
 
 a = Analysis(
-    ['main.py'],
+    ["main.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['rthook_syspath.py'],
-    excludes=[
-        # Heavy libs we never use
-        'matplotlib', 'pandas', 'PIL', 'Pillow', 'scipy',
-        'sklearn', 'cv2',
-        # Notebook / IDE
-        'notebook', 'jupyter', 'IPython', 'ipykernel',
-        # GUI toolkits
-        'tkinter', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'wx',
-        # Test frameworks (keep unittest — torch._dispatch imports unittest.mock)
-        'pytest',
-        # pydantic v1 legacy layer (huge, we use pydantic v2)
-        'pydantic.v1',
-        # numpy build tools (not needed at runtime)
-        'numpy.distutils',
-        'numpy.f2py',
-    ],
+    runtime_hooks=["rthook_syspath.py"],
+    excludes=["tkinter", "PIL", "cv2", "PyQt5", "wx",
+              "gradio", "lightning", "modelscope", "lycoris_lora", "matplotlib"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
-    cipher=None,
+    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=None)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
-    pyz,
-    a.scripts,
-    [],
+    pyz, a.scripts, [],
     exclude_binaries=True,
-    name='sidecar',
+    name="sidecar",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,         # UPX corrupts PyTorch DLLs
-    console=True,      # keep console for stdout progress protocol
+    upx=False,
+    console=True,
     disable_windowed_traceback=False,
-    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
 )
 
 coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    exe, a.binaries, a.zipfiles, a.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='sidecar',
+    name="sidecar",
 )

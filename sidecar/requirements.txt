@@ -1,27 +1,25 @@
-# AI MIDI Composer sidecar dependencies.
-# Install into a dedicated venv, then PyInstaller-freeze into sidecar.exe.
+# AI MIDI Composer v2 sidecar - ACE-Step 1.5 + Basic Pitch
+# Install torch FIRST:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# ACE-Step PyPI package has a Windows encoding bug - install from GitHub:
+#   pip install git+https://github.com/ace-step/ACE-Step-1.5.git
+# OR set PYTHONUTF8=1 before pip install ace-step
 
-# -- HTTP server --------------------------------------------------------------
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
 
-# -- Model inference ----------------------------------------------------------
-# NOTE: On CUDA systems, install the matching torch wheel FIRST, outside this
-# file, via:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-# On CPU-only, the default pypi torch wheel works.
-torch>=2.3.0
-transformers==4.45.2
-huggingface_hub==0.25.1
-accelerate==0.34.2
-safetensors==0.4.5
+# ACE-Step 1.5 - installed via build_sidecar.bat (not pip -r directly)
+# See build_sidecar.bat for the git+https install with UTF-8 fix
 
-# -- MIDI handling ------------------------------------------------------------
-mido==1.3.2
-# MIDI-LLM detokenizer lives in EleutherAI's anticipation package
-anticipation @ git+https://github.com/jthickstun/anticipation.git@main
+# Audio-to-MIDI transcription
+basic-pitch
 
-# -- Misc ---------------------------------------------------------------------
+# Audio I/O + analysis
+soundfile>=0.12.1
+librosa>=0.10.0
+
+# Misc
 numpy>=1.26
 psutil==6.0.0

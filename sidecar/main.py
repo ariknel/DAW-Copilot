@@ -1,337 +1,241 @@
 """
-AI MIDI Composer - Python sidecar.
+AI MIDI Composer - Python sidecar (v2: ACE-Step 1.5 + Basic Pitch)
 
-Runs as a child process of the JUCE VST. Communicates via:
-  - stdout: newline-delimited progress protocol (PROGRESS download 37.2, READY, ERROR ...)
-  - HTTP:   POST /generate, GET /healthz, POST /shutdown on 127.0.0.1:<port>
+Stdout protocol:
+  PROGRESS download <0-100>
+  PROGRESS load <0-100>
+  READY
+  ERROR <message>
+  INFO device=cuda|cpu
 
-Model: slseanwu/MIDI-LLM_Llama-3.2-1B (NeurIPS AI4Music 2025)
+HTTP API (127.0.0.1:<port>):
+  GET  /healthz        -> {ready, device, model}
+  POST /generate       -> {success, wav_base64, midi_base64, summary, key, tempo}
+  POST /shutdown
 """
 
-# NOTE: do NOT add "from __future__ import annotations" here.
-# It makes ALL annotations lazy strings, which breaks pydantic model
-# resolution when models are defined inside functions (like GenReq in
-# build_app). pydantic sees "GenReq" as a forward ref and can't find it.
+import sys
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import argparse
 import base64
 import io
-import json
 import os
 import re
 import signal
-import sys
 import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Optional
 
-# CRITICAL: Force the Selector event loop on Windows BEFORE any asyncio import.
-# The default ProactorEventLoop (IOCP) crashes with WinError 64 during model
-# loading when the socket accept loop hits a transient network condition.
-# SelectorEventLoop is stable and fully compatible with uvicorn + FastAPI.
-if sys.platform == "win32":
-    import asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
-# Unbuffered stdout so the host reads progress immediately
-sys.stdout.reconfigure(line_buffering=True)  # type: ignore
-
-# -- Pre-import numpy and torch on the MAIN thread before anything else -------
-# PyInstaller's module loader is NOT thread-safe. If torch/numpy are first
-# imported from a background thread while FastAPI/pydantic also triggers
-# imports on the main thread, you get:
-#   ImportError: cannot load module more than once per process
-# Solution: force both onto the main thread right here, before any threads start.
-try:
-    import numpy as _np          # noqa - side effect: registers in sys.modules
-    import torch as _torch       # noqa - side effect: registers in sys.modules
-    del _np, _torch              # don't pollute module namespace
-except Exception as _e:
-    print(f"ERROR Pre-import failed: {_e}", flush=True)
-    traceback.print_exc()
-    sys.exit(1)
-
-# -- Progress protocol helpers ------------------------------------------------
-def _emit(line: str) -> None:
-    print(line, flush=True)
-
-def emit_download(pct: float) -> None: _emit(f"PROGRESS download {pct:.1f}")
-def emit_load(pct: float)     -> None: _emit(f"PROGRESS load {pct:.1f}")
-def emit_ready()              -> None: _emit("READY")
-def emit_error(msg: str)      -> None: _emit(f"ERROR {msg}")
+_PIPELINE   = None
+_DEVICE     = "cpu"
+_READY      = threading.Event()
+_LOAD_ERROR = ""
+_GEN_LOCK   = threading.Lock()
 
 
-# -- Globals (populated by loader thread) -------------------------------------
-_MODEL = None          # transformers model
-_TOKENIZER = None      # text tokenizer
-_MIDI_TOKENIZER = None # AMT tokenizer (anticipation library)
-_DEVICE = "cpu"
-_READY = threading.Event()
-_LOAD_ERROR: Optional[str] = None
-_GEN_LOCK = threading.Lock()   # only one inference at a time
-_MODEL_ID = "slseanwu/MIDI-LLM_Llama-3.2-1B"
+def _emit(msg):   print(msg, flush=True)
+def emit_download(p): _emit(f"PROGRESS download {p:.1f}")
+def emit_load(p):     _emit(f"PROGRESS load {p:.1f}")
+def emit_ready():     _emit("READY")
+def emit_error(m):    _emit(f"ERROR {m}")
 
 
-def _load_everything(model_dir: Path) -> None:
-    """Download (if needed) + load model into memory. Runs in background thread."""
-    global _MODEL, _TOKENIZER, _MIDI_TOKENIZER, _DEVICE, _LOAD_ERROR
+def _load_everything(model_dir):
+    global _PIPELINE, _DEVICE, _LOAD_ERROR
     try:
-        emit_download(0.0)
-
-        # torch and numpy are already imported at module level (main thread).
-        # Just reference them here.
         import torch
-        from huggingface_hub import snapshot_download
 
-        # -- 1. Select device -------------------------------------------------
-        if torch.cuda.is_available():
-            _DEVICE = "cuda"
-        else:
-            _DEVICE = "cpu"
+        emit_download(0.0)
+        _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         _emit(f"INFO device={_DEVICE}")
+        emit_load(5.0)
 
-        # -- 2. Download weights with per-file progress via tqdm callback -----
-        # snapshot_download respects HF_HOME; we set it explicitly to keep
-        # the cache inside the user-chosen model directory.
-        os.environ["HF_HOME"] = str(model_dir)
-        os.environ["HF_HUB_CACHE"] = str(model_dir / "hub")
-        (model_dir / "hub").mkdir(parents=True, exist_ok=True)
+        # Set HF cache to user model dir so weights persist across reinstalls
+        hf_cache = str(model_dir / "hf_cache")
+        os.environ["HF_HOME"] = hf_cache
+        os.environ["HUGGINGFACE_HUB_CACHE"] = hf_cache
+        Path(hf_cache).mkdir(parents=True, exist_ok=True)
 
-        # Poll download size for progress emissions (HF progress bars don't
-        # play nicely with our protocol)
-        poll_stop = threading.Event()
-        expected_bytes = 3_100_000_000  # MIDI-LLM 1B bf16 is ~3GB
+        emit_download(10.0)
 
-        def _poll():
-            while not poll_stop.is_set():
-                total = 0
-                for root, _dirs, files in os.walk(model_dir / "hub"):
-                    for f in files:
-                        try:
-                            total += os.path.getsize(os.path.join(root, f))
-                        except OSError:
-                            pass
-                pct = min(99.0, 100.0 * total / expected_bytes)
-                emit_download(pct)
-                poll_stop.wait(2.0)
-
-        poll_thread = threading.Thread(target=_poll, daemon=True)
-        poll_thread.start()
+        # Import ACE-Step pipeline
         try:
-            snapshot_download(
-                repo_id=_MODEL_ID,
-                cache_dir=str(model_dir / "hub"),
-                local_files_only=False,
-            )
-        finally:
-            poll_stop.set()
-            poll_thread.join(timeout=1)
+            from ace_step.pipeline import ACEStepPipeline
+        except ImportError:
+            from acestep.pipeline import ACEStepPipeline
+
+        emit_load(20.0)
+
+        # Load - first run downloads ~4GB weights automatically
+        _PIPELINE = ACEStepPipeline.from_pretrained(
+            model_name="ace-step-v1.5-base",
+            device=_DEVICE,
+        )
 
         emit_download(100.0)
-
-        # -- 3. Load tokenizer + model ----------------------------------------
-        emit_load(5.0)
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        import torch
-
-        _TOKENIZER = AutoTokenizer.from_pretrained(_MODEL_ID, cache_dir=str(model_dir / "hub"))
-        emit_load(25.0)
-
-        dtype = torch.bfloat16 if _DEVICE == "cuda" else torch.float32
-        try:
-            _MODEL = AutoModelForCausalLM.from_pretrained(
-                _MODEL_ID,
-                cache_dir=str(model_dir / "hub"),
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            )
-            emit_load(60.0)
-            if _DEVICE == "cuda":
-                free_vram = torch.cuda.mem_get_info()[0]
-                model_size = sum(p.numel() * p.element_size() for p in _MODEL.parameters())
-                print(f"[DEBUG] VRAM free={round(free_vram/1e9,2)}GB model_size={round(model_size/1e9,2)}GB", flush=True)
-                if free_vram < model_size * 1.1:
-                    emit_error(
-                        "Not enough VRAM to load model.\n"
-                        "Need ~" + str(round(model_size / 1e9, 1)) + " GB free, have "
-                        + str(round(free_vram / 1e9, 1)) + " GB.\n"
-                        "Close other GPU applications and retry."
-                    )
-                    return
-                _MODEL = _MODEL.to(_DEVICE)
-        except (AssertionError, RuntimeError) as e:
-            import traceback as _tb
-            full_tb = _tb.format_exc()
-            print(full_tb, flush=True)
-            emit_error("Model load failed:\n" + full_tb[-600:])
-            return
-        _MODEL.eval()
-        emit_load(85.0)
-
-        # -- 4. Prepare the AMT MIDI detokenizer ------------------------------
-        # MIDI-LLM uses the vocabulary from Anticipatory Music Transformer.
-        # The 'anticipation' package provides events_to_midi.
-        try:
-            from anticipation.convert import events_to_midi  # noqa
-            _MIDI_TOKENIZER = events_to_midi
-        except ImportError:
-            emit_error("anticipation package not installed - cannot detokenize MIDI")
-            _LOAD_ERROR = "anticipation missing"
-            return
-
         emit_load(100.0)
         _READY.set()
         emit_ready()
 
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         _LOAD_ERROR = f"{type(e).__name__}: {e}"
+        print(traceback.format_exc(), flush=True)
         emit_error(_LOAD_ERROR)
-        traceback.print_exc(file=sys.stderr)
 
 
-# -- MIDI-LLM generation ------------------------------------------------------
-def _generate_midi(prompt: str, temperature: float, top_p: float, max_tokens: int) -> bytes:
-    """Run inference and return a combined multitrack MIDI file as bytes."""
-    import torch
+def _parse_params(prompt):
+    p = prompt.lower()
+    params = {"bars": None, "bpm": None, "key": None, "tempo_word": None}
 
-    # MIDI-LLM expects a fixed system prompt (per model card)
-    full_prompt = (
-        "You are a world-class composer. Please compose some music "
-        f"according to the following description: {prompt}"
+    m = re.search(r'(\d+)\s*(?:bar|bars|measure|measures)', p)
+    if m: params["bars"] = int(m.group(1))
+
+    m = re.search(r'(\d{2,3})\s*bpm', p)
+    if m: params["bpm"] = int(m.group(1))
+
+    m = re.search(r'\b([A-Ga-g][#b]?\s*(?:major|minor|maj|min)?)\b', prompt)
+    if m: params["key"] = m.group(1).strip()
+
+    if not params["bpm"]:
+        for words, bpm, label in [
+            (["very slow","largo"],                        50, "very slow"),
+            (["slow","adagio","gentle","relaxed","chill"], 75, "slow"),
+            (["medium","moderate","andante"],             105, "medium"),
+            (["fast","upbeat","energetic","driving"],     135, "fast"),
+            (["very fast","presto","intense"],            165, "very fast"),
+        ]:
+            if any(w in p for w in words):
+                params["bpm"] = bpm
+                params["tempo_word"] = label
+                break
+
+    return params
+
+
+def _build_prompt(user_prompt, params):
+    parts = []
+    if params.get("bpm"):        parts.append(f"{params['bpm']} bpm")
+    if params.get("key"):        parts.append(params["key"])
+    if params.get("tempo_word"): parts.append(params["tempo_word"])
+    parts.append(user_prompt.strip())
+    return ", ".join(parts)
+
+
+def _calc_duration(params):
+    bars = params.get("bars")
+    bpm  = params.get("bpm") or 120
+    if bars:
+        return bars * 4 * (60.0 / bpm)
+    return 30.0
+
+
+def _audio_to_midi(wav_bytes, bpm=120):
+    try:
+        import tempfile
+        from basic_pitch.inference import predict
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_bytes)
+            tmp = f.name
+        try:
+            _, midi_data, _ = predict(tmp, midi_tempo=bpm)
+            buf = io.BytesIO()
+            midi_data.write(buf)
+            return buf.getvalue()
+        finally:
+            try: os.unlink(tmp)
+            except: pass
+    except ImportError:
+        print("[WARN] basic_pitch not installed", flush=True)
+        return None
+    except Exception as e:
+        print(f"[WARN] audio_to_midi: {e}", flush=True)
+        return None
+
+
+def _analyse_wav(wav_bytes):
+    result = {"key": "", "tempo": ""}
+    try:
+        import librosa, numpy as np, soundfile as sf
+        audio, sr = sf.read(io.BytesIO(wav_bytes))
+        if audio.ndim == 2: audio = audio.mean(axis=1)
+        audio = audio.astype(float)
+        tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
+        if tempo: result["tempo"] = f"{int(round(float(tempo)))} BPM"
+        chroma = librosa.feature.chroma_cqt(y=audio, sr=sr).mean(axis=1)
+        names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+        maj = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88]
+        mnr = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
+        import numpy as np
+        maj, mnr = np.array(maj), np.array(mnr)
+        best = (None, -1.0)
+        for s in range(12):
+            for mode, prof in (("major", maj), ("minor", mnr)):
+                score = float(np.corrcoef(np.roll(prof, s), chroma)[0,1])
+                if score > best[1]: best = (f"{names[s]} {mode}", score)
+        result["key"] = best[0] or ""
+    except Exception:
+        pass
+    return result
+
+
+def _generate(prompt, duration=None, guidance_scale=7.0):
+    params = _parse_params(prompt)
+    audio_prompt = _build_prompt(prompt, params)
+    bpm = params.get("bpm") or 120
+
+    if duration is None:
+        duration = _calc_duration(params)
+    duration = max(10.0, min(600.0, duration))
+
+    print(f"[GEN] prompt={audio_prompt[:120]} duration={duration:.1f}s", flush=True)
+
+    result = _PIPELINE.generate(
+        prompt=audio_prompt,
+        duration=duration,
+        guidance_scale=guidance_scale,
+        num_inference_steps=60,
     )
 
-    input_ids = _TOKENIZER.encode(full_prompt, return_tensors="pt")
+    # Normalise pipeline output to wav_bytes
+    if isinstance(result, bytes):
+        wav_bytes = result
+    elif hasattr(result, "audio"):
+        import soundfile as sf
+        buf = io.BytesIO()
+        audio = result.audio
+        sr = getattr(result, "sample_rate", 44100)
+        sf.write(buf, audio, sr, format="WAV")
+        wav_bytes = buf.getvalue()
+    elif isinstance(result, (str, Path)):
+        wav_bytes = Path(result).read_bytes()
+    else:
+        raise RuntimeError(f"Unknown pipeline output: {type(result)}")
 
-    # Ensure model and inputs are on the same device
-    actual_device = next(_MODEL.parameters()).device
-    print(f"[DEBUG] _DEVICE={_DEVICE} model_device={actual_device}", flush=True)
-    input_ids = input_ids.to(actual_device)
+    print(f"[GEN] wav={len(wav_bytes)} bytes", flush=True)
 
-    with torch.no_grad():
-        out_ids = _MODEL.generate(
-            input_ids,
-            max_new_tokens=max_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=_TOKENIZER.eos_token_id,
-        )
+    midi_bytes = _audio_to_midi(wav_bytes, bpm=bpm)
+    meta       = _analyse_wav(wav_bytes)
 
-    # Strip the prompt tokens - keep only newly generated ones
-    new_ids = out_ids[0, input_ids.shape[1]:].tolist()
+    parts = []
+    if meta["key"]:    parts.append(f"key of {meta['key']}")
+    if meta["tempo"]:  parts.append(meta["tempo"])
+    if params["bars"]: parts.append(f"{params['bars']} bars")
+    summary = ("Generated: " + ", ".join(parts) + ".") if parts else \
+              "Generated. Drag stems into your DAW."
 
-    # The model embedding matrix splits at 128256 (per model card: "extends Llama 3.2's
-    # vocabulary of 128,256 tokens"). tokenizer.vocab_size returns 128000 which is the
-    # Llama 3.2 *tokenizer* vocab, but the embedding uses 128256 as the boundary.
-    MIDI_OFFSET = 128_256
-    all_midi = [t - MIDI_OFFSET for t in new_ids if t >= MIDI_OFFSET]
-
-    if not all_midi:
-        MIDI_OFFSET = 128_000
-        all_midi = [t - MIDI_OFFSET for t in new_ids if t >= MIDI_OFFSET]
-
-    print(f"[DEBUG] offset={MIDI_OFFSET} generated={len(new_ids)} "
-          f"midi_count={len(all_midi)} "
-          f"min={min(all_midi) if all_midi else 'N/A'} "
-          f"max={max(all_midi) if all_midi else 'N/A'}", flush=True)
-
-    if not all_midi:
-        raise RuntimeError(f"Model produced no MIDI tokens. Sample: {new_ids[:10]}")
-
-    # The anticipation library vocab layout (from vocab.py):
-    #   TIME_OFFSET=0,     valid time tokens:  0 <= t < 10000
-    #   DUR_OFFSET=10000,  valid dur tokens:   10000 <= t < 11000
-    #   NOTE_OFFSET=11000, valid note tokens:  11000 <= t < 27513
-    #   CONTROL_OFFSET=27513 (anticipated tokens, interleaved for infilling)
-    #
-    # The model generates triplets: (time, duration, note) interleaved with
-    # anticipated control tokens. We extract only complete valid triplets.
-    # Build triplets by scanning for valid (time, dur, note) sequences.
-    TIME_MIN, TIME_MAX = 0, 9999
-    DUR_MIN,  DUR_MAX  = 10000, 10999
-    NOTE_MIN, NOTE_MAX = 11000, 27512
-
-    triplets = []
-    i = 0
-    while i < len(all_midi) - 2:
-        t0, t1, t2 = all_midi[i], all_midi[i+1], all_midi[i+2]
-        if (TIME_MIN <= t0 <= TIME_MAX and
-            DUR_MIN  <= t1 <= DUR_MAX  and
-            NOTE_MIN <= t2 <= NOTE_MAX):
-            triplets.extend([t0, t1, t2])
-            i += 3
-        else:
-            i += 1  # skip and rescan
-
-    print(f"[DEBUG] valid triplets extracted: {len(triplets)//3} notes "
-          f"({len(triplets)} tokens)", flush=True)
-
-    if not triplets:
-        raise RuntimeError(
-            f"No valid (time, duration, note) triplets found in {len(all_midi)} tokens. "
-            f"Sample: {all_midi[:15]}"
-        )
-
-    midi_obj = _MIDI_TOKENIZER(triplets)
-
-    buf = io.BytesIO()
-    midi_obj.save(file=buf)
-    return buf.getvalue()
+    return {"wav_bytes": wav_bytes, "midi_bytes": midi_bytes,
+            "key": meta["key"], "tempo": meta["tempo"], "summary": summary}
 
 
-# -- Post-processing: detect key / tempo / time-signature from MIDI bytes -----
-def _analyse_midi(midi_bytes: bytes) -> dict:
-    import mido
-    mid = mido.MidiFile(file=io.BytesIO(midi_bytes))
-
-    tempo_bpm = None
-    timesig = None
-    for track in mid.tracks:
-        for msg in track:
-            if msg.type == "set_tempo" and tempo_bpm is None:
-                tempo_bpm = round(mido.tempo2bpm(msg.tempo))
-            elif msg.type == "time_signature" and timesig is None:
-                timesig = f"{msg.numerator}/{msg.denominator}"
-        if tempo_bpm is not None and timesig is not None:
-            break
-
-    # Very rough key estimate from note histogram vs major/minor profiles
-    # (good enough for chat metadata; users don't expect music-theoretic precision)
-    try:
-        import numpy as np
-        notes = []
-        for track in mid.tracks:
-            for msg in track:
-                if msg.type == "note_on" and msg.velocity > 0:
-                    notes.append(msg.note % 12)
-        key_str = None
-        if notes:
-            hist = np.bincount(notes, minlength=12).astype(float)
-            hist /= hist.sum() + 1e-9
-            names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-            # Krumhansl-Kessler profiles
-            maj = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
-            mnr = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
-            best = (None, -1.0)
-            for shift in range(12):
-                for mode, prof in (("major", maj), ("minor", mnr)):
-                    score = float(np.corrcoef(np.roll(prof, shift), hist)[0, 1])
-                    if score > best[1]:
-                        best = (f"{names[shift]} {mode}", score)
-            key_str = best[0]
-    except Exception:
-        key_str = None
-
-    return {
-        "key": key_str or "",
-        "tempo": (f"{tempo_bpm} BPM" if tempo_bpm else ""),
-        "time_signature": timesig or "",
-    }
-
-
-# -- HTTP layer ---------------------------------------------------------------
 def build_app():
     from fastapi import FastAPI
     from pydantic import BaseModel
@@ -339,14 +243,14 @@ def build_app():
     app = FastAPI()
 
     class GenReq(BaseModel):
-        prompt: str
-        temperature: float = 0.9
-        top_p: float = 0.98
-        max_tokens: int = 2000
+        prompt:         str
+        duration:       Optional[float] = None
+        guidance_scale: float = 7.0
 
     @app.get("/healthz")
     def healthz():
-        return {"ready": _READY.is_set(), "error": _LOAD_ERROR}
+        return {"ready": _READY.is_set(), "error": _LOAD_ERROR,
+                "device": _DEVICE, "model": "ace-step-v1.5"}
 
     @app.post("/generate")
     def generate(req: GenReq):
@@ -355,22 +259,20 @@ def build_app():
         with _GEN_LOCK:
             t0 = time.time()
             try:
-                midi_bytes = _generate_midi(req.prompt, req.temperature, req.top_p, req.max_tokens)
+                r = _generate(req.prompt, req.duration, req.guidance_scale)
             except Exception as e:
-                import traceback as _tb
-                tb = _tb.format_exc()
+                tb = traceback.format_exc()
                 print(tb, flush=True)
-                return {"success": False, "error": f"{type(e).__name__}: {e}\n\n{tb[-400:]}"}
-            meta = _analyse_midi(midi_bytes)
+                return {"success": False, "error": f"{type(e).__name__}: {e}"}
 
             return {
-                "success": True,
-                "midi_base64": base64.b64encode(midi_bytes).decode("ascii"),
-                "key": meta["key"],
-                "tempo": meta["tempo"],
-                "time_signature": meta["time_signature"],
-                "summary": _compose_summary(req.prompt, meta),
-                "seconds": time.time() - t0,
+                "success":      True,
+                "wav_base64":   base64.b64encode(r["wav_bytes"]).decode(),
+                "midi_base64":  base64.b64encode(r["midi_bytes"]).decode() if r["midi_bytes"] else "",
+                "key":          r["key"],
+                "tempo":        r["tempo"],
+                "summary":      r["summary"],
+                "seconds":      round(time.time() - t0, 1),
             }
 
     @app.post("/shutdown")
@@ -381,49 +283,30 @@ def build_app():
     return app
 
 
-def _compose_summary(prompt: str, meta: dict) -> str:
-    bits = []
-    if meta["key"]:            bits.append(f"key of {meta['key']}")
-    if meta["tempo"]:          bits.append(meta["tempo"])
-    if meta["time_signature"]: bits.append(f"{meta['time_signature']} time")
-    if not bits:
-        return "Here's a composition matching your prompt. Drag any stem into your DAW."
-    return "Composed in " + ", ".join(bits) + ". Drag any stem into your DAW."
-
-
-# -- Entry point --------------------------------------------------------------
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--model-dir", type=Path, required=True)
-    ap.add_argument("--parent-pid", type=int, default=0,
-                    help="If set, sidecar self-terminates when parent dies.")
+    ap.add_argument("--port",       type=int,  required=True)
+    ap.add_argument("--model-dir",  type=Path, required=True)
+    ap.add_argument("--parent-pid", type=int,  default=0)
     args = ap.parse_args()
-
     args.model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Watchdog: kill self if parent PID dies (backup to Windows Job Object)
     if args.parent_pid:
         def _watchdog():
-            import psutil
-            while True:
-                if not psutil.pid_exists(args.parent_pid):
-                    os._exit(0)
-                time.sleep(1.0)
+            try:
+                import psutil
+                while True:
+                    if not psutil.pid_exists(args.parent_pid): os._exit(0)
+                    time.sleep(1.0)
+            except ImportError: pass
         threading.Thread(target=_watchdog, daemon=True).start()
 
-    # Kick off background model load
-    threading.Thread(
-        target=_load_everything, args=(args.model_dir,), daemon=True
-    ).start()
+    threading.Thread(target=_load_everything, args=(args.model_dir,), daemon=True).start()
 
-    # Serve HTTP immediately so /healthz works during loading
     import uvicorn
-    app = build_app()
-    # Use asyncio loop explicitly - avoids WinError 64 IOCP proactor crash on Windows
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning", loop="asyncio")
-    return 0
+    uvicorn.run(build_app(), host="127.0.0.1", port=args.port,
+                log_level="warning", loop="asyncio")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
