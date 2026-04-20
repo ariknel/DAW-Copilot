@@ -60,17 +60,12 @@ The MIDI-LLM / Llama 3.2 1B model and the Anticipation AMT tokenizer have been *
 
 ## 📸 Screenshots
 
-> *(Replace with real screenshots before release)*
 
 ![Workflow placeholder](docs/images/workflow_placeholder.png)
-*↑ Chat interface inside FL Studio — prompt → audio stems → MIDI extraction → drag to tracks*
+*↑ Chat interface inside DAW — prompt → audio stems → MIDI extraction → drag to tracks*
 
 ---
-
 ## 🎬 Quick Demo
-
-> *(Embed a GIF or YouTube link here)*
-
 ---
 
 ## ⬇️ Download & Install
