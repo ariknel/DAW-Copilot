@@ -7,6 +7,7 @@
 [![VST3](https://img.shields.io/badge/Plugin%20Format-VST3-orange.svg)](https://www.steinberg.net/vst3/)
 [![JUCE 8](https://img.shields.io/badge/Framework-JUCE%208-green.svg)](https://juce.com/)
 [![Model: ACE-Step](https://img.shields.io/badge/Model-ACE--Step-purple.svg)](https://github.com/ace-step/ACE-Step)
+[![Audio-to-MIDI: Basic Pitch](https://img.shields.io/badge/Audio--to--MIDI-Basic%20Pitch%20(Spotify)-1DB954.svg)](https://github.com/spotify/basic-pitch)
 
 ---
 
@@ -191,11 +192,15 @@ ACE-Step is the core generative model. It produces high-quality, realistic audio
 |----------|------|
 | 🎵 ACE-Step | [GitHub — ace-step/ACE-Step](https://github.com/ace-step/ACE-Step) |
 
-### Audio-to-MIDI Conversion
+### Audio-to-MIDI Conversion — Basic Pitch (Spotify)
 
-Each isolated stem is processed by a dedicated audio-to-MIDI engine to extract playable, editable MIDI.
+Each isolated stem is processed by **Basic Pitch**, Spotify's open-source automatic music transcription library. It is instrument-agnostic, supports polyphonic recordings, includes pitch bend detection, and runs faster than real time on most modern CPUs — making it a natural fit for the sidecar pipeline.
 
-> *(Link to the specific audio-to-MIDI engine/model used — add when confirmed)*
+| Resource | Link |
+|----------|------|
+| 🎵 Basic Pitch — GitHub | [github.com/spotify/basic-pitch](https://github.com/spotify/basic-pitch) |
+| 📄 Basic Pitch — paper (ICASSP 2022) | [A Lightweight Instrument-Agnostic Model for Polyphonic Note Transcription](https://arxiv.org/abs/2206.09916) |
+| 🤗 Basic Pitch — Hugging Face | [huggingface.co/spotify/basic-pitch](https://huggingface.co/spotify/basic-pitch) |
 
 ### Supporting Libraries
 
@@ -295,7 +300,7 @@ AIDawCopilot/
 | **First-launch model download** | ACE-Step weights and the audio-to-MIDI model download on first run |
 | **Generation is blocking** | ACE-Step runs one request at a time. UI shows a progress indicator and disables Send during inference |
 | **Stem isolation** | Performed post-generation; users can request the full mix, a specific bus, or individual elements (kick, snare, bass, etc.) |
-| **Audio-to-MIDI** | Applied per isolated stem after separation; MIDI accuracy depends on stem cleanliness — isolated mono sources (kick, bass) convert most accurately |
+| **Audio-to-MIDI** | Powered by **Basic Pitch** (Spotify, Apache 2.0); applied per isolated stem after separation. MIDI accuracy is highest on clean, isolated mono sources (kick, bass) and degrades on dense polyphonic layers |
 | **Drag targets** | Each chip exposes both a WAV and a MIDI drag handle — drop either onto a DAW track |
 | **Iterative refinement** | Implemented by flattening prior conversation into a continuation directive appended to each new prompt |
 | **Sidecar process lifetime** | Managed via Windows Job Object — sidecar is killed automatically if the DAW crashes or exits |
@@ -321,13 +326,14 @@ Areas especially open for contribution:
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
 
-ACE-Step model weights and the audio-to-MIDI engine are subject to their own licenses — see their respective repositories.
+ACE-Step model weights are subject to their own license — see their repository. Basic Pitch is released under the Apache 2.0 License.
 
 ---
 
 ## 🙏 Acknowledgements
 
 - [ACE-Step](https://github.com/ace-step/ACE-Step) for the audio generation model
+- [Basic Pitch](https://github.com/spotify/basic-pitch) (Spotify Audio Intelligence Lab) for the audio-to-MIDI transcription engine
 - [JUCE](https://juce.com/) for the VST3 / audio plugin framework
 - [FastAPI](https://fastapi.tiangolo.com/) and [Uvicorn](https://www.uvicorn.org/) for the sidecar HTTP layer
 - [mido](https://mido.readthedocs.io/) for MIDI file I/O
