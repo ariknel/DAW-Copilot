@@ -5,13 +5,14 @@
 
 namespace AIMC {
 
-/** A single MIDI stem belonging to an assistant message. */
+/** A single stem belonging to an assistant message. v2 has both WAV + MIDI. */
 struct Stem {
-    std::string  instrumentName;   // "Piano", "Bass", "Drums" etc.
-    int          generalMidiProgram = 0;     // 0-127 GM program
+    std::string  instrumentName;       // "Generated Audio", "Piano" etc.
+    int          generalMidiProgram = 0;
     int          noteCount = 0;
     double       durationSeconds = 0.0;
-    juce::File   midiFile;                   // absolute path on disk
+    juce::File   midiFile;             // Basic Pitch MIDI transcription
+    juce::File   wavFile;              // ACE-Step generated audio (v2)
 };
 
 enum class MessageRole { User, Assistant, System };

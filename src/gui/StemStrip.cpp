@@ -7,7 +7,14 @@ namespace AIMC {
 StemStrip::StemStrip(const Stem& s) : m_stem(s)
 {
     setMouseCursor(juce::MouseCursor::DraggingHandCursor);
-    setTooltip("Drag into your DAW");
+    bool hasWav  = s.wavFile.existsAsFile();
+    bool hasMidi = s.midiFile.existsAsFile();
+    if (hasWav && hasMidi)
+        setTooltip("Drag into DAW  (WAV audio)  -  right-click for MIDI");
+    else if (hasWav)
+        setTooltip("Drag into DAW (WAV audio)");
+    else
+        setTooltip("Drag into DAW (MIDI)");
 }
 
 void StemStrip::paint(juce::Graphics& g)
@@ -17,7 +24,9 @@ void StemStrip::paint(juce::Graphics& g)
     g.setColour(bg);
     g.fillRoundedRectangle(r, 6.f);
 
-    g.setColour(Colours::accent);
+    // Dot colour: green for WAV, blue for MIDI-only
+    g.setColour(m_stem.wavFile.existsAsFile() ? Colours::accent
+                                               : juce::Colour(0xff4a9eff));
     g.fillEllipse(r.getX() + 8.f, r.getCentreY() - 4.f, 8.f, 8.f);
 
     g.setColour(Colours::textPrimary);
@@ -26,10 +35,13 @@ void StemStrip::paint(juce::Graphics& g)
     g.drawFittedText(juce::String(m_stem.instrumentName),
                      textArea.toNearestInt(), juce::Justification::centredLeft, 1);
 
+    // Show WAV/MIDI badge and duration
     g.setColour(Colours::textSecondary);
     g.setFont(juce::Font(juce::FontOptions(10.f)));
-    auto meta = juce::String(m_stem.noteCount) + " notes | "
-              + juce::String(m_stem.durationSeconds, 1) + "s";
+    juce::String badge = m_stem.wavFile.existsAsFile() ? "WAV" : "MIDI";
+    juce::String meta  = badge;
+    if (m_stem.durationSeconds > 0.0)
+        meta += " | " + juce::String(m_stem.durationSeconds, 1) + "s";
     g.drawFittedText(meta,
                      textArea.removeFromBottom(14).toNearestInt(),
                      juce::Justification::bottomLeft, 1);
@@ -44,12 +56,27 @@ void StemStrip::mouseDrag(const juce::MouseEvent& e)
 {
     if (m_dragStarted) return;
     if (e.getDistanceFromDragStart() < 8) return;
-    if (! m_stem.midiFile.existsAsFile()) return;
+
+    // Prefer WAV; fall back to MIDI
+    juce::File dragFile = m_stem.wavFile.existsAsFile()  ? m_stem.wavFile
+                        : m_stem.midiFile.existsAsFile() ? m_stem.midiFile
+                        : juce::File{};
+    if (! dragFile.existsAsFile()) return;
 
     m_dragStarted = true;
     juce::StringArray paths;
-    paths.add(m_stem.midiFile.getFullPathName());
+    paths.add(dragFile.getFullPathName());
     WinFileDragSource::performDrag(paths);
+}
+
+void StemStrip::mouseUp(const juce::MouseEvent& e)
+{
+    // Right-click: if we have both WAV and MIDI, offer MIDI drag on right click
+    if (e.mods.isRightButtonDown() && m_stem.midiFile.existsAsFile()) {
+        juce::StringArray paths;
+        paths.add(m_stem.midiFile.getFullPathName());
+        WinFileDragSource::performDrag(paths);
+    }
 }
 
 void StemStrip::mouseEnter(const juce::MouseEvent&) { m_hovered = true;  repaint(); }

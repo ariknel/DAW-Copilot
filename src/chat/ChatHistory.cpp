@@ -16,18 +16,11 @@ void ChatHistory::clear()
 
 juce::String ChatHistory::buildFlattenedPrompt(const juce::String& newUserPrompt) const
 {
-    // Strategy: walk history, accumulate musical constraints that should
-    // carry forward (key, tempo, instrumentation, mood), then append the
-    // new user ask. MIDI-LLM responds well to descriptive paragraphs.
-    //
-    // If no prior context, pass through verbatim.
     if (m_messages.empty())
         return newUserPrompt;
 
-    juce::String context;
-    int assistantTurns = 0;
     juce::String lastKey, lastTempo, lastTimeSig;
-    std::vector<juce::String> lastInstruments;
+    int assistantTurns = 0;
 
     for (const auto& m : m_messages) {
         if (m.role == MessageRole::Assistant && ! m.isError) {
@@ -35,28 +28,18 @@ juce::String ChatHistory::buildFlattenedPrompt(const juce::String& newUserPrompt
             if (m.detectedKey.isNotEmpty())     lastKey     = m.detectedKey;
             if (m.detectedTempo.isNotEmpty())   lastTempo   = m.detectedTempo;
             if (m.detectedTimeSig.isNotEmpty()) lastTimeSig = m.detectedTimeSig;
-            lastInstruments.clear();
-            for (const auto& s : m.stems)
-                lastInstruments.push_back(juce::String(s.instrumentName));
         }
     }
 
     if (assistantTurns == 0)
         return newUserPrompt;
 
-    // Build a continuation directive MIDI-LLM understands:
-    context << "Continuing from the previous composition";
+    // Build context that carries musical constraints forward
+    juce::String context;
+    context << "Continuation of a piece";
     if (lastKey.isNotEmpty())     context << " in " << lastKey;
-    if (lastTimeSig.isNotEmpty()) context << " with a " << lastTimeSig << " time signature";
-    if (lastTempo.isNotEmpty())   context << " at a " << lastTempo << " tempo";
-    if (! lastInstruments.empty()) {
-        context << ", featuring ";
-        for (size_t i = 0; i < lastInstruments.size(); ++i) {
-            context << lastInstruments[i];
-            if (i + 2 < lastInstruments.size()) context << ", ";
-            else if (i + 1 < lastInstruments.size()) context << " and ";
-        }
-    }
+    if (lastTimeSig.isNotEmpty()) context << " (" << lastTimeSig << " time)";
+    if (lastTempo.isNotEmpty())   context << " at " << lastTempo;
     context << ". " << newUserPrompt;
 
     return context;

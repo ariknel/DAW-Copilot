@@ -24,13 +24,13 @@ public:
 
     using StatusCallback = std::function<void(const StatusUpdate&)>;
 
-    /** Result of a generation request. `midiBytes` contains a complete multitrack
-        .mid file. Instrument names come from GM program classification done by
-        the sidecar (which already splits the MIDI per-program during inference). */
+    /** Result of a generation request.
+        v2: wavBytes contains audio, midiBytes contains Basic Pitch transcription. */
     struct GenerationResult {
         bool                         success = false;
         juce::String                 errorMessage;
-        juce::MemoryBlock            combinedMidiBytes;
+        juce::MemoryBlock            wavBytes;           // WAV audio (new in v2)
+        juce::MemoryBlock            combinedMidiBytes;  // MIDI from Basic Pitch
         juce::String                 detectedKey;
         juce::String                 detectedTempo;
         juce::String                 detectedTimeSig;
@@ -47,13 +47,10 @@ public:
     /** Stop the backend cleanly. */
     virtual void stop() = 0;
 
-    /** Submit a prompt. Calls `done` on the message thread when complete.
-        `cancelHandle` can be used to cancel if the editor is destroyed. */
     struct Request {
         juce::String prompt;
-        float        temperature = 0.9f;
-        float        topP        = 0.98f;
-        int          maxTokens   = 2000;
+        float        guidanceScale = 7.0f;
+        float        duration      = 0.0f;  // 0 = infer from bars+BPM in prompt
     };
 
     virtual void generate(Request req,

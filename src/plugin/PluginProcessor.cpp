@@ -73,10 +73,12 @@ juce::File PluginProcessor::locateBundledSidecar() const
 {
     auto programFiles = juce::File::getSpecialLocation(
         juce::File::globalApplicationsDirectory);
+
+    // v2: venv mode - launch sidecar.cmd which activates venv and runs main.py
     auto installed = programFiles
         .getChildFile("AIMidiComposer")
         .getChildFile("sidecar")
-        .getChildFile("sidecar.exe");
+        .getChildFile("sidecar.cmd");
     if (installed.existsAsFile()) return installed;
 
    #if JUCE_WINDOWS
@@ -92,7 +94,7 @@ juce::File PluginProcessor::locateBundledSidecar() const
             auto beside = juce::File(juce::String(path))
                               .getParentDirectory()
                               .getChildFile("sidecar")
-                              .getChildFile("sidecar.exe");
+                              .getChildFile("sidecar.cmd");
             if (beside.existsAsFile()) return beside;
         }
     }

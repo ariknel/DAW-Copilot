@@ -30,6 +30,11 @@ private:
     std::unique_ptr<SidecarManager> m_sidecar;
     std::atomic<Status>         m_status { Status::NotStarted };
     StatusCallback              m_statusCb;
+    std::atomic<int>            m_sidecarPort { 0 };  // set atomically after launch, read from any thread
+
+    juce::String baseUrl() const {
+        return "http://127.0.0.1:" + juce::String(m_sidecarPort.load());
+    }
 
     // Single in-flight request thread (MIDI-LLM inference isn't thread-safe anyway).
     std::unique_ptr<std::thread> m_inflight;

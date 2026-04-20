@@ -4,8 +4,7 @@
 
 namespace AIMC {
 
-/** Displays one MIDI stem as a draggable chip. Click-and-hold initiates a
-    Windows OLE file drag so the user can drop into any DAW track. */
+/** Displays one stem as a draggable chip. Left-drag = WAV, right-click = MIDI. */
 class StemStrip : public juce::Component,
                   public juce::SettableTooltipClient
 {
@@ -15,6 +14,7 @@ public:
     void paint(juce::Graphics&) override;
     void mouseDown(const juce::MouseEvent&) override;
     void mouseDrag(const juce::MouseEvent&) override;
+    void mouseUp(const juce::MouseEvent&) override;
     void mouseEnter(const juce::MouseEvent&) override;
     void mouseExit(const juce::MouseEvent&) override;
 

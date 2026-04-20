@@ -50,7 +50,26 @@ void HttpSidecarBackend::start(StatusCallback onStatus)
                 float pct = line.fromFirstOccurrenceOf("PROGRESS load ", false, false).getFloatValue();
                 updateStatus(Status::LoadingModel, "Loading model into memory...", pct / 100.f);
             } else if (line.startsWith("READY")) {
-                updateStatus(Status::Ready, "Model ready.", 1.f);
+                // Uvicorn needs ~500-1000ms after printing READY to fully bind its socket.
+                // Probe healthz with retries before declaring Ready to the UI.
+                std::thread([this]() {
+                    juce::Thread::sleep(800);
+                    for (int attempt = 0; attempt < 10; ++attempt) {
+                        int hCode = 0;
+                        auto url = juce::URL("http://127.0.0.1:" + juce::String(m_sidecarPort.load()) + "/healthz");
+                        auto stream = url.createInputStream(
+                            juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+                                .withConnectionTimeoutMs(2000)
+                                .withStatusCode(&hCode));
+                        if (stream && hCode == 200) {
+                            updateStatus(Status::Ready, "Model ready.", 1.f);
+                            return;
+                        }
+                        juce::Thread::sleep(500);
+                    }
+                    updateStatus(Status::Failed, "Sidecar printed READY but healthz never responded.\nPort: "
+                        + juce::String(m_sidecarPort.load()), 0.f);
+                }).detach();
             } else if (line.startsWith("ERROR ")) {
                 auto errMsg = line.substring(6);
                 errMsg << "\n\nFull sidecar log: " << m_logFile.getFullPathName();
@@ -67,9 +86,10 @@ void HttpSidecarBackend::start(StatusCallback onStatus)
             updateStatus(Status::Failed,
                          reason.isEmpty() ? juce::String("Failed to launch sidecar process.")
                                           : reason);
+            return;
         }
-        // SidecarManager owns its own crash-detection timer.
-        // HttpSidecarBackend's healthz timer is a fallback for buffered stdout.
+        // Store port atomically - readable from generate() thread without locking
+        m_sidecarPort.store(m_sidecar->portInUse());
         juce::MessageManager::callAsync([this]() { startTimer(2000); });
     }).detach();
 }
@@ -77,6 +97,7 @@ void HttpSidecarBackend::start(StatusCallback onStatus)
 void HttpSidecarBackend::stop()
 {
     stopTimer();
+    m_sidecarPort.store(0);
     if (m_inflight && m_inflight->joinable())
         m_inflight->join();
     if (m_sidecar) {
@@ -103,7 +124,7 @@ void HttpSidecarBackend::dispatchHealthCheck()
 {
     // Non-blocking health check on a throwaway thread
     std::thread([this]() {
-        auto url = juce::URL(m_sidecar->baseUrl() + "/healthz");
+        auto url = juce::URL(baseUrl() + "/healthz");
         int statusCode = 0;
         auto stream = url.createInputStream(
             juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
@@ -146,25 +167,52 @@ void HttpSidecarBackend::generate(Request req,
             return;
         }
 
-        juce::var body(new juce::DynamicObject());
-        body.getDynamicObject()->setProperty("prompt",      req.prompt);
-        body.getDynamicObject()->setProperty("temperature", (double) req.temperature);
-        body.getDynamicObject()->setProperty("top_p",       (double) req.topP);
-        body.getDynamicObject()->setProperty("max_tokens",  req.maxTokens);
+        if (m_sidecarPort.load() == 0) {
+            GenerationResult r;
+            r.success = false;
+            r.errorMessage = "Sidecar port not assigned. Try restarting the plugin.";
+            finish(r);
+            return;
+        }
 
+        juce::var body(new juce::DynamicObject());
+        body.getDynamicObject()->setProperty("prompt",          req.prompt);
+        body.getDynamicObject()->setProperty("guidance_scale",  (double) req.guidanceScale);
+        if (req.duration > 0.f)
+            body.getDynamicObject()->setProperty("duration", (double) req.duration);
+
+        auto generationUrl = baseUrl() + "/generate";
         auto bodyStr = juce::JSON::toString(body);
-        auto url = juce::URL(m_sidecar->baseUrl() + "/generate").withPOSTData(bodyStr);
+        auto url = juce::URL(generationUrl).withPOSTData(bodyStr);
+
+        // Confirm sidecar is reachable before sending the full request
+        bool reachable = false;
+        for (int attempt = 0; attempt < 3 && !reachable; ++attempt) {
+            if (attempt > 0) juce::Thread::sleep(500);
+            int hCode = 0;
+            auto hStream = juce::URL(baseUrl() + "/healthz").createInputStream(
+                juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+                    .withConnectionTimeoutMs(3000)
+                    .withStatusCode(&hCode));
+            reachable = (hStream && hCode == 200);
+        }
+        if (!reachable) {
+            GenerationResult r; r.success = false;
+            r.errorMessage = "Sidecar not reachable at " + baseUrl()
+                + "\nCheck sidecar.log for details.";
+            finish(r); return;
+        }
 
         int statusCode = 0;
         auto stream = url.createInputStream(
             juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inPostData)
                 .withExtraHeaders("Content-Type: application/json")
-                .withConnectionTimeoutMs(10 * 60 * 1000)       // generations can be slow on CPU
+                .withConnectionTimeoutMs(10 * 60 * 1000)
                 .withStatusCode(&statusCode));
 
         if (! stream) {
             GenerationResult r; r.success = false;
-            r.errorMessage = "Could not connect to sidecar.";
+            r.errorMessage = "Lost connection to sidecar at " + baseUrl() + " during generation.";
             finish(r); return;
         }
         if (statusCode != 200) {
@@ -190,8 +238,16 @@ void HttpSidecarBackend::generate(Request req,
         r.assistantSummary  = parsed.getProperty("summary", {}).toString();
         r.generationSeconds = parsed.getProperty("seconds", 0.0);
 
-        // MIDI comes back as base64 in the JSON (keeps the protocol plain-text
-        // friendly and debuggable with curl).
+        // WAV audio (new in v2 with ACE-Step)
+        auto wavB64 = parsed.getProperty("wav_base64", {}).toString();
+        if (wavB64.isNotEmpty()) {
+            juce::MemoryOutputStream mos;
+            juce::Base64::convertFromBase64(mos, wavB64);
+            r.wavBytes.setSize(mos.getDataSize());
+            std::memcpy(r.wavBytes.getData(), mos.getData(), mos.getDataSize());
+        }
+
+        // MIDI from Basic Pitch transcription
         auto midiB64 = parsed.getProperty("midi_base64", {}).toString();
         if (midiB64.isNotEmpty()) {
             juce::MemoryOutputStream mos;

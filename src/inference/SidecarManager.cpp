@@ -64,9 +64,24 @@ bool SidecarManager::launch(const Config& cfg)
     si.hStdError   = hStdoutWrite;
     si.dwFlags     = STARTF_USESTDHANDLES;
 
-    juce::String cmdLine = "\"" + m_sidecarPath + "\""
+    juce::String cmdLine;
+   #if JUCE_WINDOWS
+    // .cmd files require cmd.exe to run - can't CreateProcess a batch file directly
+    auto ext = cfg.sidecarExecutable.getFileExtension().toLowerCase();
+    if (ext == ".cmd" || ext == ".bat") {
+        cmdLine = "cmd.exe /c \"\"" + m_sidecarPath + "\""
+            + " --port " + juce::String(m_port)
+            + " --model-dir \"" + cfg.modelDirectory.getFullPathName() + "\"\"";
+    } else {
+        cmdLine = "\"" + m_sidecarPath + "\""
+            + " --port " + juce::String(m_port)
+            + " --model-dir \"" + cfg.modelDirectory.getFullPathName() + "\"";
+    }
+   #else
+    cmdLine = "\"" + m_sidecarPath + "\""
         + " --port " + juce::String(m_port)
         + " --model-dir \"" + cfg.modelDirectory.getFullPathName() + "\"";
+   #endif
 
     PROCESS_INFORMATION pi = {};
     auto cmdW = cmdLine.toWideCharPointer();
