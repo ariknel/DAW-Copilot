@@ -83,23 +83,25 @@ bool SidecarManager::launch(const Config& cfg)
         + " --model-dir \"" + cfg.modelDirectory.getFullPathName() + "\"";
    #endif
 
+    if (onLogLine) onLogLine("[Sidecar] CMD: " + cmdLine);
+
     PROCESS_INFORMATION pi = {};
     auto cmdW = cmdLine.toWideCharPointer();
     auto cwdW = workingDir.getFullPathName().toWideCharPointer();
 
     BOOL created = ::CreateProcessW(
         nullptr, const_cast<LPWSTR>(cmdW),
-        nullptr, nullptr, TRUE,   // bInheritHandles = TRUE for pipe
+        nullptr, nullptr, TRUE,
         CREATE_NO_WINDOW,
         nullptr, cwdW, &si, &pi);
 
-    // Close the write end in our process immediately - the child owns it now
     ::CloseHandle(hStdoutWrite);
 
     if (! created) {
         ::CloseHandle(hStdoutRead);
         m_lastError = "CreateProcess failed (error " + juce::String((int)::GetLastError()) + ").\n"
-                    "Antivirus may be blocking sidecar.exe.";
+                    "CMD: " + cmdLine + "\n"
+                    "Check sidecar.cmd exists and antivirus is not blocking it.";
         if (onLogLine) onLogLine("[Sidecar] " + m_lastError);
         return false;
     }

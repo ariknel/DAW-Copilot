@@ -47,6 +47,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; Wipe previous installs before copying new files (prevents Error 183)
 Type: filesandordirs; Name: "{pf}\Common Files\VST3\{#VST3Name}"
 Type: filesandordirs; Name: "{pf}\AIMidiComposer\sidecar"
+Type: filesandordirs; Name: "{pf}\AIMidiComposer\venv"
 
 [Files]
 ; VST3 plugin DLL - goes in the standard VST3 folder (small, just the DLL)

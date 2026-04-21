@@ -324,14 +324,14 @@ del "!WRAP_PY!"
 :: Write sidecar.cmd which CreateProcess can launch via cmd.exe /c
 :: After install: sidecar\ is at C:\Program Files\AIMidiComposer\sidecar\
 ::                venv\    is at C:\Program Files\AIMidiComposer\venv\
+:: Use python.exe directly - avoids activate.bat issues when launched from C++
 (
     echo @echo off
     echo set PYTHONUTF8=1
     echo set PYTHONIOENCODING=utf-8
     echo set "SIDECAR_DIR=%%~dp0"
-    echo set "VENV_DIR=%%SIDECAR_DIR%%..\venv"
-    echo call "%%VENV_DIR%%\Scripts\activate.bat"
-    echo python "%%SIDECAR_DIR%%main.py" %%*
+    echo set "PYTHON_EXE=%%SIDECAR_DIR%%..\venv\Scripts\python.exe"
+    echo "%%PYTHON_EXE%%" "%%SIDECAR_DIR%%main.py" %%*
 ) > "!DIST_DIR!\sidecar.cmd"
 
 call "!VENV_DIR!\Scripts\deactivate.bat"
