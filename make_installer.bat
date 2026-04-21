@@ -82,6 +82,11 @@ echo.
 echo  ============================================================
 echo   SUCCESS
 echo  ============================================================
-for %%F in ("dist\AIMidiComposer-Installer.exe") do echo   Size: %%~zF bytes
+echo   dist\AIMidiComposer-Installer.exe  (run this to install)
+echo   dist\AIMidiComposer-Installer-1.bin  (keep alongside .exe)
+echo   NOTE: Keep all dist\ files together when distributing.
+echo.
+for %%F in ("dist\AIMidiComposer-Installer.exe") do echo   Setup.exe : %%~zF bytes
+for %%F in ("dist\AIMidiComposer-Installer-1.bin") do echo   Data .bin : %%~zF bytes
 echo.
 pause

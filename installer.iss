@@ -24,8 +24,12 @@ AllowNoIcons=yes
 OutputDir=dist
 OutputBaseFilename=AIMidiComposer-Installer
 
-; venv.zip is already compressed - recompressing wastes time
-; Store it uncompressed so Inno compiles fast and extraction is fast
+; venv.zip is 5+ GB uncompressed - must use disk spanning
+; This creates Setup.exe + Setup-1.bin (user runs Setup.exe, it finds Setup-1.bin automatically)
+DiskSpanning=yes
+DiskSliceSize=max
+
+; venv.zip is already uncompressed - don't recompress
 Compression=none
 SolidCompression=no
 
