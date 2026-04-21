@@ -1,4 +1,4 @@
-; AI MIDI Composer - Inno Setup 5 Script
+; AI MIDI Composer - Inno Setup 6 Script
 ; Pure ASCII only
 
 #define AppName     "AI MIDI Composer"
@@ -45,17 +45,18 @@ Source: "sidecar\dist\sidecar\*"; \
     DestDir: "{#SidecarDir}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
-Source: "sidecar\dist\venv_a.zip"; DestDir: "{#InstDir}"; Flags: ignoreversion
-Source: "sidecar\dist\venv_b.zip"; DestDir: "{#InstDir}"; Flags: ignoreversion; Check: FileExists(ExpandConstant('{src}\sidecar\dist\venv_b.zip'))
-Source: "sidecar\dist\venv_c.zip"; DestDir: "{#InstDir}"; Flags: ignoreversion; Check: FileExists(ExpandConstant('{src}\sidecar\dist\venv_c.zip'))
-Source: "sidecar\dist\venv_d.zip"; DestDir: "{#InstDir}"; Flags: ignoreversion; Check: FileExists(ExpandConstant('{src}\sidecar\dist\venv_d.zip'))
+Source: "sidecar\dist\venv.zip"; \
+    DestDir: "{#InstDir}"; \
+    Flags: ignoreversion
 
-Source: "docs\README.txt"; DestDir: "{#InstDir}"; Flags: ignoreversion
+Source: "docs\README.txt"; \
+    DestDir: "{#InstDir}"; \
+    Flags: ignoreversion
 
 [Run]
 Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -Command ""Get-ChildItem '{#InstDir}\venv_*.zip' | ForEach-Object {{ Expand-Archive -Path $_.FullName -DestinationPath '{#InstDir}\venv' -Force; Remove-Item $_.FullName -Force }}"""; \
-    StatusMsg: "Extracting Python environment..."; \
+    Parameters: "-NoProfile -Command ""Expand-Archive -Path '{#InstDir}\venv.zip' -DestinationPath '{#InstDir}\venv' -Force; Remove-Item '{#InstDir}\venv.zip' -Force"""; \
+    StatusMsg: "Extracting Python environment (may take a minute)..."; \
     Flags: runhidden waituntilterminated
 
 Filename: "netsh"; \
