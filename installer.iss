@@ -44,8 +44,7 @@ Type: filesandordirs; Name: "{pf}\AIMidiComposer\venv"
 ; VST3 plugin (small - compress this)
 Source: "build\AIMidiComposerVST_artefacts\Release\VST3\{#VST3Name}\*"; \
     DestDir: "{pf}\Common Files\VST3\{#VST3Name}"; \
-    Flags: ignoreversion recursesubdirs createallsubdirs; \
-    StrongAssemblyName: ""
+    Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Sidecar scripts (tiny)
 Source: "sidecar\dist\sidecar\*"; \
