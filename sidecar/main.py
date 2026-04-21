@@ -138,26 +138,83 @@ def _calc_duration(params):
 
 
 def _audio_to_midi(wav_bytes, bpm=120):
+    """
+    Transcribe WAV to MIDI using librosa pitch tracking + pretty_midi.
+    No TensorFlow dependency. Works best on single-instrument audio.
+    """
     try:
-        import tempfile
-        from basic_pitch.inference import predict
+        import librosa
+        import pretty_midi
+        import numpy as np
+        import soundfile as sf
+        import io as _io
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(wav_bytes)
-            tmp = f.name
-        try:
-            _, midi_data, _ = predict(tmp, midi_tempo=bpm)
-            buf = io.BytesIO()
-            midi_data.write(buf)
-            return buf.getvalue()
-        finally:
-            try: os.unlink(tmp)
-            except: pass
-    except ImportError:
-        print("[WARN] basic_pitch not installed", flush=True)
+        # Load audio
+        audio, sr = sf.read(_io.BytesIO(wav_bytes))
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        audio = audio.astype(np.float32)
+
+        # Pitch tracking via pYIN (librosa) - good for melodic content
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            audio, sr=sr,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7"),
+            frame_length=2048,
+        )
+
+        # Convert f0 to MIDI notes
+        times = librosa.times_like(f0, sr=sr, hop_length=512)
+        midi = pretty_midi.PrettyMIDI(initial_tempo=float(bpm))
+        instrument = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
+
+        # Merge consecutive voiced frames into notes
+        note_start = None
+        note_pitch = None
+        for i, (t, freq, voiced) in enumerate(zip(times, f0, voiced_flag)):
+            if voiced and freq is not None and not np.isnan(freq):
+                pitch = int(round(librosa.hz_to_midi(freq)))
+                pitch = max(0, min(127, pitch))
+                if note_pitch is None:
+                    note_start = t
+                    note_pitch = pitch
+                elif abs(pitch - note_pitch) > 1:
+                    # Pitch changed - end previous note
+                    if note_start is not None and t - note_start > 0.05:
+                        note = pretty_midi.Note(
+                            velocity=80, pitch=note_pitch,
+                            start=note_start, end=t
+                        )
+                        instrument.notes.append(note)
+                    note_start = t
+                    note_pitch = pitch
+            else:
+                if note_start is not None and note_pitch is not None:
+                    end_t = t
+                    if end_t - note_start > 0.05:
+                        note = pretty_midi.Note(
+                            velocity=80, pitch=note_pitch,
+                            start=note_start, end=end_t
+                        )
+                        instrument.notes.append(note)
+                note_start = None
+                note_pitch = None
+
+        if not instrument.notes:
+            print("[WARN] audio_to_midi: no notes detected via pYIN", flush=True)
+            return None
+
+        midi.instruments.append(instrument)
+        buf = _io.BytesIO()
+        midi.write(buf)
+        print(f"[GEN] MIDI: {len(instrument.notes)} notes transcribed", flush=True)
+        return buf.getvalue()
+
+    except ImportError as e:
+        print(f"[WARN] audio_to_midi missing dep: {e}", flush=True)
         return None
     except Exception as e:
-        print(f"[WARN] audio_to_midi: {e}", flush=True)
+        print(f"[WARN] audio_to_midi failed: {e}", flush=True)
         return None
 
 

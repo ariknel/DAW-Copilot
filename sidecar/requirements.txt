@@ -1,25 +1,15 @@
-# AI MIDI Composer v2 sidecar - ACE-Step 1.5 + Basic Pitch
-# Install torch FIRST:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-#
-# ACE-Step PyPI package has a Windows encoding bug - install from GitHub:
-#   pip install git+https://github.com/ace-step/ACE-Step-1.5.git
-# OR set PYTHONUTF8=1 before pip install ace-step
+# AI MIDI Composer v2 sidecar
+# torch is installed separately in build_sidecar.bat (CUDA wheel)
 
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
 
-# ACE-Step 1.5 - installed via build_sidecar.bat (not pip -r directly)
-# See build_sidecar.bat for the git+https install with UTF-8 fix
-
-# Audio-to-MIDI transcription
-basic-pitch
-
-# Audio I/O + analysis
+# Audio I/O + analysis (no TensorFlow conflict)
 soundfile>=0.12.1
 librosa>=0.10.0
+numpy>=1.26
+pretty_midi>=0.2.9
 
 # Misc
-numpy>=1.26
 psutil==6.0.0
