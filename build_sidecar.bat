@@ -244,16 +244,23 @@ if errorlevel 1 (
 )
 
 :: Now install ACE-Step's actual required deps manually (excluding nano-vllm)
+:: Note: torch 2.5.1+cu121 already installed - skip torch/torchaudio/torchvision
+:: (ACE-Step wants 2.7.1+cu128 but 2.5.1+cu121 works for inference)
 python -m pip install ^
-    "accelerate>=1.12.0" ^
-    "diffusers>=0.37.0" ^
+    "accelerate>=0.26.0" ^
+    "diffusers>=0.30.0" ^
     "diskcache" ^
-    "einops>=0.8.1" ^
-    "loguru>=0.7.3" ^
-    "transformers>=4.40.0" ^
+    "einops>=0.8.0" ^
+    "loguru>=0.7.0" ^
+    "transformers>=4.40.0,<5.0.0" ^
     "huggingface_hub>=0.20.0" ^
     "safetensors>=0.4.0" ^
-    "tqdm"
+    "tqdm" ^
+    "peft>=0.10.0" ^
+    "scipy>=1.10.0" ^
+    "soundfile>=0.12.1" ^
+    "toml" ^
+    "vector-quantize-pytorch>=1.14.0"
 if errorlevel 1 (
     call "!VENV_DIR!\Scripts\deactivate.bat"
     echo  [ERROR] Failed to install ACE-Step dependencies.
