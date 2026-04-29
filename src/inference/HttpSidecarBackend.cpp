@@ -225,6 +225,7 @@ void HttpSidecarBackend::generate(Request req,
             finish(r); return;
         }
 
+        // Revert to simple string read - response is now small (just file paths)
         auto respStr = stream->readEntireStreamAsString();
         auto parsed  = juce::JSON::parse(respStr);
         if (! parsed.isObject()) {
@@ -242,22 +243,28 @@ void HttpSidecarBackend::generate(Request req,
         r.assistantSummary  = parsed.getProperty("summary", {}).toString();
         r.generationSeconds = parsed.getProperty("seconds", 0.0);
 
-        // WAV audio (new in v2 with ACE-Step)
-        auto wavB64 = parsed.getProperty("wav_base64", {}).toString();
-        if (wavB64.isNotEmpty()) {
-            juce::MemoryOutputStream mos;
-            juce::Base64::convertFromBase64(mos, wavB64);
-            r.wavBytes.setSize(mos.getDataSize());
-            std::memcpy(r.wavBytes.getData(), mos.getData(), mos.getDataSize());
+        // WAV audio - sidecar saves to temp file, we read it from disk
+        auto wavPath = parsed.getProperty("wav_path", {}).toString();
+        if (wavPath.isNotEmpty()) {
+            juce::File wavFile(wavPath);
+            if (wavFile.existsAsFile()) {
+                juce::FileInputStream fis(wavFile);
+                auto size = (size_t)fis.getTotalLength();
+                r.wavBytes.setSize(size);
+                fis.read(r.wavBytes.getData(), (int)size);
+            }
         }
 
-        // MIDI from Basic Pitch transcription
-        auto midiB64 = parsed.getProperty("midi_base64", {}).toString();
-        if (midiB64.isNotEmpty()) {
-            juce::MemoryOutputStream mos;
-            juce::Base64::convertFromBase64(mos, midiB64);
-            r.combinedMidiBytes.setSize(mos.getDataSize());
-            std::memcpy(r.combinedMidiBytes.getData(), mos.getData(), mos.getDataSize());
+        // MIDI transcription file path
+        auto midiPath = parsed.getProperty("midi_path", {}).toString();
+        if (midiPath.isNotEmpty()) {
+            juce::File midiFile(midiPath);
+            if (midiFile.existsAsFile()) {
+                juce::FileInputStream fis(midiFile);
+                auto size = (size_t)fis.getTotalLength();
+                r.combinedMidiBytes.setSize(size);
+                fis.read(r.combinedMidiBytes.getData(), (int)size);
+            }
         }
 
         finish(r);

@@ -43,6 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Type: filesandordirs; Name: "{pf}\Common Files\VST3\{#VST3Name}"
 Type: filesandordirs; Name: "{pf}\AIMidiComposer\sidecar"
 Type: filesandordirs; Name: "{pf}\AIMidiComposer\venv"
+Type: files;          Name: "{pf}\AIMidiComposer\sidecar\sidecar.exe"
 
 [Files]
 ; VST3 plugin (small - compress this)
@@ -71,12 +72,19 @@ Source: "docs\README.txt"; \
     Flags: ignoreversion
 
 [Run]
-; Use the system Python to extract venv (much faster than PowerShell Expand-Archive)
-; Falls back to PowerShell if Python not on PATH
-Filename: "cmd.exe"; \
-    Parameters: "/c python ""{#InstDir}\extract_venv.py"" ""{#InstDir}\venv.zip"" ""{#InstDir}\venv"" || powershell -NoProfile -Command ""Expand-Archive '{#InstDir}\venv.zip' '{#InstDir}\venv' -Force; Remove-Item '{#InstDir}\venv.zip'"""; \
-    StatusMsg: "Extracting Python environment..."; \
+; GPU optimization: patch ACE-Step eager->sdpa and remove 600s timeout
+; Done via Code section below to avoid Inno Setup {constant} parsing issues
+Filename: "powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{#InstDir}\patch_gpu.ps1"""; \
+    StatusMsg: "Optimizing GPU performance..."; \
     Flags: runhidden waituntilterminated
+
+; Extract venv using py launcher (always available if Python 3 installed)
+; Shows a console window so user can see progress (not runhidden)
+Filename: "cmd.exe"; \
+    Parameters: "/c title Extracting AI MIDI Composer... && py ""{#InstDir}\extract_venv.py"" ""{#InstDir}\venv.zip"" ""{#InstDir}\venv"" && exit || python ""{#InstDir}\extract_venv.py"" ""{#InstDir}\venv.zip"" ""{#InstDir}\venv"""; \
+    StatusMsg: "Extracting Python environment (this takes 1-2 minutes)..."; \
+    Flags: waituntilterminated
 
 ; Firewall rule
 Filename: "netsh"; \
@@ -94,8 +102,33 @@ Type: filesandordirs; Name: "{pf}\AIMidiComposer"
 
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
-var Msg: String;
+var
+  Msg, PsPath, PsContent: String;
 begin
+  if CurStep = ssPostInstall then
+  begin
+    // Write patch_gpu.ps1 to InstDir during file installation phase
+    // (avoids Inno Setup {constant} parsing issues with PowerShell syntax)
+    PsPath := ExpandConstant('{pf}\AIMidiComposer\patch_gpu.ps1');
+    PsContent :=
+      '$base = "' + ExpandConstant('{pf}') + '\AIMidiComposer\venv\Lib\site-packages\acestep\core\generation\handler"' + #13#10 +
+      '$loader = Join-Path $base "init_service_loader.py"' + #13#10 +
+      '$timeout = Join-Path $base "generate_music_execute.py"' + #13#10 +
+      'if (Test-Path $loader) {' + #13#10 +
+      '    $c = Get-Content $loader -Encoding UTF8 -Raw' + #13#10 +
+      '    $c = $c -replace "eager", "sdpa"' + #13#10 +
+      '    Set-Content $loader $c -Encoding UTF8' + #13#10 +
+      '    Write-Host "Patched: eager -> sdpa"' + #13#10 +
+      '}' + #13#10 +
+      'if (Test-Path $timeout) {' + #13#10 +
+      '    $c = Get-Content $timeout -Encoding UTF8 -Raw' + #13#10 +
+      '    $c = $c -replace "(?<!\d)600(?!\d)", "86400"' + #13#10 +
+      '    Set-Content $timeout $c -Encoding UTF8' + #13#10 +
+      '    Write-Host "Patched: timeout 600s -> 86400s"' + #13#10 +
+      '}';
+    SaveStringToFile(PsPath, PsContent, False);
+  end;
+
   if CurStep = ssDone then
   begin
     Msg := '{#AppName} installed.' + #13#10 + #13#10 +

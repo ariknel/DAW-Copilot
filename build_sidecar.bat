@@ -266,7 +266,11 @@ python -m pip install ^
     "scipy>=1.10.0" ^
     "soundfile>=0.12.1" ^
     "toml" ^
-    "vector-quantize-pytorch>=1.14.0"
+    "vector-quantize-pytorch>=1.14.0" ^
+    "gradio==6.2.0" ^
+    "matplotlib>=3.7.0" ^
+    "pytorch_wavelets" ^
+    "PyWavelets"
 if errorlevel 1 (
     call "!VENV_DIR!\Scripts\deactivate.bat"
     echo  [ERROR] Failed to install ACE-Step dependencies.
@@ -285,6 +289,29 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+:: Verify all critical imports work before packaging
+echo  [..] Verifying critical imports...
+python -c "from acestep.handler import AceStepHandler; from acestep.inference import GenerationParams, GenerationConfig, generate_music; print('  [OK] ACE-Step handler imports')"
+if errorlevel 1 (
+    echo  [ERROR] ACE-Step handler import failed. Installing missing deps...
+    python -m pip install "gradio==6.2.0" "matplotlib>=3.7.0" "lycoris-lora" "lightning"
+    python -c "from acestep.handler import AceStepHandler; from acestep.inference import GenerationParams, GenerationConfig, generate_music; print('  [OK] ACE-Step handler imports (retry OK)')"
+    if errorlevel 1 (
+        call "!VENV_DIR!\Scripts\deactivate.bat"
+        echo  [ERROR] Cannot import ACE-Step handler. Check build log above.
+        pause
+        exit /b 1
+    )
+)
+python -c "import fastapi, uvicorn, librosa, pretty_midi, soundfile; print('  [OK] all server deps')"
+if errorlevel 1 (
+    call "!VENV_DIR!\Scripts\deactivate.bat"
+    echo  [ERROR] Server dependency import failed.
+    pause
+    exit /b 1
+)
+echo  [OK] All imports verified.
 
 echo  [..] Skipping PyInstaller - shipping venv directly instead.
 echo  [..] (PyInstaller cannot reliably freeze ACE-Step native extensions)
@@ -311,6 +338,11 @@ copy /y "sidecar\main.py" "!DIST_DIR!\main.py" >nul
     echo set PYTHONIOENCODING=utf-8
     echo set "PYTHON_EXE=C:\Program Files\AIMidiComposer\venv\Scripts\python.exe"
     echo set "MAIN_PY=C:\Program Files\AIMidiComposer\sidecar\main.py"
+    echo set "VENV_SP=C:\Program Files\AIMidiComposer\venv\Lib\site-packages"
+    echo echo [sidecar.cmd] Python: %%PYTHON_EXE%%
+    echo echo [sidecar.cmd] acestep dir exists: 1
+    echo if not exist "%%VENV_SP%%\acestep" echo [sidecar.cmd] WARNING: acestep NOT found in site-packages
+    echo if not exist "%%VENV_SP%%\acestep\pipeline.py" echo [sidecar.cmd] WARNING: pipeline.py NOT found
     echo "%%PYTHON_EXE%%" "%%MAIN_PY%%" %%*
 ) > "!DIST_DIR!\sidecar.cmd"
 

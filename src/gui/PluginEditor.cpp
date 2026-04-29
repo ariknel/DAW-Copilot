@@ -193,7 +193,7 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     setSize(760, 680);
     setResizable(true, true);
     setResizeLimits(560, 460, 1800, 1400);
-    startTimerHz(4);
+    startTimerHz(2);  // 2Hz - enough for smooth elapsed time display
 }
 
 PluginEditor::~PluginEditor()
@@ -402,6 +402,22 @@ void PluginEditor::onBackendStatus(const InferenceBackend::StatusUpdate& u)
 void PluginEditor::timerCallback()
 {
     m_input.setSendEnabled(m_isModelReady && !m_isGenerating);
+
+    // Update elapsed time display while generating
+    if (m_isGenerating) {
+        auto elapsed = juce::Time::currentTimeMillis() - m_generationStartMs;
+        int secs  = (int)(elapsed / 1000);
+        int mins  = secs / 60;
+        secs     %= 60;
+        juce::String timeStr = juce::String(mins) + ":" + juce::String(secs).paddedLeft('0', 2);
+        juce::String status  = "Generating...  " + timeStr;
+
+        // Warn if taking a long time (GPU may be slow)
+        if (elapsed > 120000)
+            status = "Generating (GPU is working, please wait)  " + timeStr;
+
+        showStatusLine(status);
+    }
 }
 
 // ============================================================
@@ -423,8 +439,12 @@ void PluginEditor::setGenerating(bool on)
 {
     m_isGenerating = on;
     m_input.setSendEnabled(!on && m_isModelReady);
-    if (on) showStatusLine("Generating...");
-    else    showStatusLine(m_isModelReady ? (m_readyStatusMsg.isEmpty() ? juce::String("Ready") : m_readyStatusMsg) : juce::String("Idle"));
+    if (on) {
+        m_generationStartMs = juce::Time::currentTimeMillis();
+        showStatusLine("Generating...  0:00");
+    } else {
+        showStatusLine(m_isModelReady ? (m_readyStatusMsg.isEmpty() ? juce::String("Ready") : m_readyStatusMsg) : juce::String("Idle"));
+    }
 }
 
 // ============================================================
