@@ -72,10 +72,10 @@ Source: "docs\README.txt"; \
     Flags: ignoreversion
 
 [Run]
-; GPU optimization: patch ACE-Step eager->sdpa and remove 600s timeout
-; Done via Code section below to avoid Inno Setup {constant} parsing issues
-Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{#InstDir}\patch_gpu.ps1"""; \
+; Patch ACE-Step: eager->sdpa and 600s->86400s timeout
+; Uses the installed venv's Python directly - no external files needed
+Filename: "{pf}\AIMidiComposer\venv\Scripts\python.exe"; \
+    Parameters: "-c ""import pathlib; base=pathlib.Path(r'{pf}\AIMidiComposer\venv\Lib\site-packages\acestep\core\generation\handler'); [f.write_text(f.read_text(encoding='utf-8').replace('eager','sdpa'), encoding='utf-8') for f in [base/'init_service_loader.py'] if f.exists()]; [f.write_text(__import__('re').sub(r'(?<!\d)600(?!\d)','86400',f.read_text(encoding='utf-8')), encoding='utf-8') for f in [base/'generate_music_execute.py'] if f.exists()]; print('GPU patches applied')"""; \
     StatusMsg: "Optimizing GPU performance..."; \
     Flags: runhidden waituntilterminated
 
@@ -102,33 +102,8 @@ Type: filesandordirs; Name: "{pf}\AIMidiComposer"
 
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
-var
-  Msg, PsPath, PsContent: String;
+var Msg: String;
 begin
-  if CurStep = ssPostInstall then
-  begin
-    // Write patch_gpu.ps1 to InstDir during file installation phase
-    // (avoids Inno Setup {constant} parsing issues with PowerShell syntax)
-    PsPath := ExpandConstant('{pf}\AIMidiComposer\patch_gpu.ps1');
-    PsContent :=
-      '$base = "' + ExpandConstant('{pf}') + '\AIMidiComposer\venv\Lib\site-packages\acestep\core\generation\handler"' + #13#10 +
-      '$loader = Join-Path $base "init_service_loader.py"' + #13#10 +
-      '$timeout = Join-Path $base "generate_music_execute.py"' + #13#10 +
-      'if (Test-Path $loader) {' + #13#10 +
-      '    $c = Get-Content $loader -Encoding UTF8 -Raw' + #13#10 +
-      '    $c = $c -replace "eager", "sdpa"' + #13#10 +
-      '    Set-Content $loader $c -Encoding UTF8' + #13#10 +
-      '    Write-Host "Patched: eager -> sdpa"' + #13#10 +
-      '}' + #13#10 +
-      'if (Test-Path $timeout) {' + #13#10 +
-      '    $c = Get-Content $timeout -Encoding UTF8 -Raw' + #13#10 +
-      '    $c = $c -replace "(?<!\d)600(?!\d)", "86400"' + #13#10 +
-      '    Set-Content $timeout $c -Encoding UTF8' + #13#10 +
-      '    Write-Host "Patched: timeout 600s -> 86400s"' + #13#10 +
-      '}';
-    SaveStringToFile(PsPath, PsContent, False);
-  end;
-
   if CurStep = ssDone then
   begin
     Msg := '{#AppName} installed.' + #13#10 + #13#10 +

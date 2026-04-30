@@ -215,13 +215,27 @@ set PYTHONIOENCODING=utf-8
 :: Install build backend first
 python -m pip install hatchling --quiet
 
-:: Clone ACE-Step repo to a temp location
+:: Clone ACE-Step repo with retries (network can be flaky)
 set "ACESTEP_TMP=%TEMP%\acestep_src"
 if exist "!ACESTEP_TMP!" rmdir /s /q "!ACESTEP_TMP!"
-git clone --depth=1 --quiet https://github.com/ace-step/ACE-Step-1.5.git "!ACESTEP_TMP!"
-if errorlevel 1 (
+
+set CLONE_OK=0
+for /L %%i in (1,1,3) do (
+    if "!CLONE_OK!"=="0" (
+        echo  [..] Clone attempt %%i of 3...
+        git clone --depth=1 --quiet https://github.com/ace-step/ACE-Step-1.5.git "!ACESTEP_TMP!" 2>nul
+        if not errorlevel 1 set CLONE_OK=1
+        if "!CLONE_OK!"=="0" (
+            echo  [..] Clone failed, retrying in 5s...
+            timeout /t 5 /nobreak >nul
+            if exist "!ACESTEP_TMP!" rmdir /s /q "!ACESTEP_TMP!"
+        )
+    )
+)
+if "!CLONE_OK!"=="0" (
     call "!VENV_DIR!\Scripts\deactivate.bat"
-    echo  [ERROR] Failed to clone ACE-Step. Check git is installed.
+    echo  [ERROR] Failed to clone ACE-Step after 3 attempts.
+    echo          Check your internet connection and try again.
     pause
     exit /b 1
 )
