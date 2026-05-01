@@ -72,21 +72,19 @@ Source: "docs\README.txt"; \
     Flags: ignoreversion
 
 [Run]
-; Patch ACE-Step: eager->sdpa and 600s->86400s timeout
-; Uses the installed venv's Python directly - no external files needed
-Filename: "{pf}\AIMidiComposer\venv\Scripts\python.exe"; \
-    Parameters: "-c ""import pathlib; base=pathlib.Path(r'{pf}\AIMidiComposer\venv\Lib\site-packages\acestep\core\generation\handler'); [f.write_text(f.read_text(encoding='utf-8').replace('eager','sdpa'), encoding='utf-8') for f in [base/'init_service_loader.py'] if f.exists()]; [f.write_text(__import__('re').sub(r'(?<!\d)600(?!\d)','86400',f.read_text(encoding='utf-8')), encoding='utf-8') for f in [base/'generate_music_execute.py'] if f.exists()]; print('GPU patches applied')"""; \
-    StatusMsg: "Optimizing GPU performance..."; \
-    Flags: runhidden waituntilterminated
-
-; Extract venv using py launcher (always available if Python 3 installed)
-; Shows a console window so user can see progress (not runhidden)
+; Step 1: Extract venv (python.exe doesn't exist until this runs)
 Filename: "cmd.exe"; \
     Parameters: "/c title Extracting AI MIDI Composer... && py ""{#InstDir}\extract_venv.py"" ""{#InstDir}\venv.zip"" ""{#InstDir}\venv"" && exit || python ""{#InstDir}\extract_venv.py"" ""{#InstDir}\venv.zip"" ""{#InstDir}\venv"""; \
     StatusMsg: "Extracting Python environment (this takes 1-2 minutes)..."; \
     Flags: waituntilterminated
 
-; Firewall rule
+; Step 2: Patch ACE-Step files using the now-extracted venv python.exe
+Filename: "{pf}\AIMidiComposer\venv\Scripts\python.exe"; \
+    Parameters: "-c ""import pathlib,re; base=pathlib.Path(r'{pf}\AIMidiComposer\venv\Lib\site-packages\acestep\core\generation\handler'); f1=base/'init_service_loader.py'; f1.write_text(f1.read_text(encoding='utf-8').replace('eager','sdpa'),encoding='utf-8') if f1.exists() else None; f2=base/'generate_music_execute.py'; f2.write_text(re.sub(r'(?<!\d)600(?!\d)','86400',f2.read_text(encoding='utf-8')),encoding='utf-8') if f2.exists() else None; print('Patches applied')"""; \
+    StatusMsg: "Optimizing GPU performance..."; \
+    Flags: runhidden waituntilterminated
+
+; Step 3: Firewall rule
 Filename: "netsh"; \
     Parameters: "advfirewall firewall add rule name=""AI MIDI Composer Sidecar"" dir=in action=allow program=""{pf}\AIMidiComposer\venv\Scripts\python.exe"" enable=yes profile=any"; \
     Flags: runhidden
