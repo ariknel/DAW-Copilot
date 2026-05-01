@@ -1,33 +1,13 @@
 """
-AI MIDI Composer - Python sidecar (v2: ACE-Step 1.5 + Basic Pitch)
-
-Stdout protocol:
-  PROGRESS download <0-100>
-  PROGRESS load <0-100>
-  READY
-  ERROR <message>
-  INFO device=cuda|cpu
-
-HTTP API (127.0.0.1:<port>):
-  GET  /healthz        -> {ready, device, model}
-  POST /generate       -> {success, wav_base64, midi_base64, summary, key, tempo}
-  POST /shutdown
+AI MIDI Composer v2 sidecar - ACE-Step 1.5 audio generation
+Stdout protocol: PROGRESS download/load <0-100>, READY, ERROR <msg>, INFO device=cuda|cpu
 """
-
 import sys
 if sys.platform == "win32":
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-import argparse
-import base64
-import io
-import os
-import re
-import signal
-import threading
-import time
-import traceback
+import argparse, io, os, re, signal, threading, time, traceback
 from pathlib import Path
 from typing import Optional
 
@@ -39,9 +19,10 @@ _DEVICE     = "cpu"
 _READY      = threading.Event()
 _LOAD_ERROR = ""
 _GEN_LOCK   = threading.Lock()
+_DIT_READY  = threading.Event()  # set when DiT is on GPU and ready
+_DIT_READY.set()                 # starts True
 
-
-def _emit(msg):   print(msg, flush=True)
+def _emit(msg):       print(msg, flush=True)
 def emit_download(p): _emit(f"PROGRESS download {p:.1f}")
 def emit_load(p):     _emit(f"PROGRESS load {p:.1f}")
 def emit_ready():     _emit("READY")
@@ -52,38 +33,128 @@ def _load_everything(model_dir):
     global _PIPELINE, _DEVICE, _LOAD_ERROR
     try:
         import torch
-
         emit_download(0.0)
         _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         _emit(f"INFO device={_DEVICE}")
         emit_load(5.0)
 
-        # Set HF cache to user model dir so weights persist across reinstalls
-        hf_cache = str(model_dir / "hf_cache")
-        os.environ["HF_HOME"] = hf_cache
-        os.environ["HUGGINGFACE_HUB_CACHE"] = hf_cache
-        Path(hf_cache).mkdir(parents=True, exist_ok=True)
+        checkpoints_dir = str(model_dir / "checkpoints")
+        os.environ.setdefault("ACESTEP_CHECKPOINTS_DIR", checkpoints_dir)
+        os.environ.setdefault("ACESTEP_INIT_LLM", "false")
+        os.environ.setdefault("ACESTEP_OFFLOAD_TO_CPU", "true")
+        os.environ.setdefault("OMP_NUM_THREADS", "6")
+        os.environ.setdefault("MKL_NUM_THREADS", "6")
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+        # Lower process priority so DAW stays responsive
+        try:
+            import psutil
+            psutil.Process(os.getpid()).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            print("[LOAD] Process priority set to BELOW_NORMAL", flush=True)
+        except Exception as e:
+            print(f"[LOAD] Priority set failed: {e}", flush=True)
+
+        # Configure SDPA backends
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print("[LOAD] SDPA: mem_efficient=ON flash=OFF math=ON, shared memory UVM enabled", flush=True)
+
+        # Patch eager->sdpa and 600s timeout in ACE-Step files
+        for mod_name, find, replace in [
+            ("acestep.core.generation.handler.init_service_loader", "eager", "sdpa"),
+        ]:
+            try:
+                import importlib
+                mod = importlib.import_module(mod_name)
+                src_path = mod.__file__
+                src = open(src_path, encoding="utf-8").read()
+                if find in src:
+                    open(src_path, "w", encoding="utf-8").write(src.replace(find, replace))
+                    print(f"[LOAD] Patched {mod_name}: {find}->{replace}", flush=True)
+                else:
+                    print(f"[LOAD] {mod_name} already patched or no {find} found", flush=True)
+            except PermissionError:
+                print(f"[LOAD] Cannot patch {mod_name} - run as admin", flush=True)
+            except Exception as e:
+                print(f"[LOAD] Patch failed: {e}", flush=True)
+
+        try:
+            import acestep.core.generation.handler.generate_music_execute as _gme
+            import re as _re
+            src = open(_gme.__file__, encoding="utf-8").read()
+            if "600" in src:
+                open(_gme.__file__, "w", encoding="utf-8").write(
+                    _re.sub(r'(?<!\d)600(?!\d)', '86400', src))
+                print("[LOAD] Patched timeout 600s->86400s", flush=True)
+        except PermissionError:
+            print("[LOAD] Cannot patch timeout - run as admin", flush=True)
+        except Exception as e:
+            print(f"[LOAD] Timeout patch failed: {e}", flush=True)
 
         emit_download(10.0)
 
-        # Import ACE-Step pipeline
+        # Install pytorch_wavelets if missing
         try:
-            from ace_step.pipeline import ACEStepPipeline
+            import pytorch_wavelets  # noqa
         except ImportError:
-            from acestep.pipeline import ACEStepPipeline
+            print("[LOAD] Installing pytorch_wavelets...", flush=True)
+            import subprocess
+            subprocess.run([sys.executable, "-m", "pip", "install",
+                            "pytorch_wavelets", "PyWavelets", "--quiet"], check=False)
 
+        from acestep.handler import AceStepHandler
         emit_load(20.0)
 
-        # CPU needs float32; CUDA can use bfloat16 for speed/memory
-        torch_dtype = torch.bfloat16 if _DEVICE == "cuda" else torch.float32
-        print(f"[LOAD] device={_DEVICE} dtype={torch_dtype}", flush=True)
+        _PIPELINE = AceStepHandler()
+        print(f"[LOAD] device={_DEVICE} initializing handler...", flush=True)
 
-        # Load - first run downloads ~4GB weights automatically
-        _PIPELINE = ACEStepPipeline.from_pretrained(
-            model_name="ace-step-v1.5-base",
+        _PIPELINE.initialize_service(
+            project_root=str(model_dir),
+            config_path="acestep-v15-turbo",
             device=_DEVICE,
-            torch_dtype=torch_dtype,
         )
+
+        # Patch VAE decode to offload DiT to CPU, freeing VRAM for GPU VAE
+        # DiT reloads to GPU in background AFTER response is sent
+        try:
+            import acestep.core.generation.handler.generate_music_decode as _dec_mod
+            _orig_decode = _dec_mod.GenerateMusicDecodeMixin._decode_generate_music_pred_latents
+
+            def _patched_decode(self, *args, **kwargs):
+                import torch as _torch
+                # Find DiT model
+                dit_attr = None
+                for attr in ('model', 'dit_model', 'dit', 'transformer', 'unet'):
+                    if hasattr(self, attr) and hasattr(getattr(self, attr), 'parameters'):
+                        dit_attr = attr
+                        break
+
+                if dit_attr:
+                    try:
+                        _DIT_READY.clear()  # mark DiT as not ready
+                        getattr(self, dit_attr).to('cpu')
+                        _torch.cuda.empty_cache()
+                        print(f"[VAE] Moved {dit_attr} to CPU for VAE decode", flush=True)
+                    except Exception as e:
+                        print(f"[VAE] Offload failed: {e}", flush=True)
+                        dit_attr = None
+                        _DIT_READY.set()
+
+                result = _orig_decode(self, *args, **kwargs)
+
+                # Keep DiT on CPU after VAE - it will reload when next generation starts
+                # This keeps VRAM free between generations
+                _DIT_READY.set()
+                print(f"[VAE] {dit_attr} stays on CPU (VRAM freed for next gen)", flush=True)
+
+                return result
+
+            _dec_mod.GenerateMusicDecodeMixin._decode_generate_music_pred_latents = _patched_decode
+            print("[LOAD] VAE decode patch applied: DiT will offload to CPU before VAE", flush=True)
+        except Exception as e:
+            print(f"[LOAD] VAE patch failed: {e}", flush=True)
+            _DIT_READY.set()
 
         emit_download(100.0)
         emit_load(100.0)
@@ -98,18 +169,14 @@ def _load_everything(model_dir):
 
 def _parse_params(prompt):
     p = prompt.lower()
-    params = {"bars": None, "bpm": None, "key": None, "tempo_word": None}
-
-    m = re.search(r'(\d+)\s*(?:bar|bars|measure|measures)', p)
-    if m: params["bars"] = int(m.group(1))
-
+    out = {"bars": None, "bpm": None, "key": None, "tempo_word": None}
+    m = re.search(r'(\d+)\s*(?:bar|bars|measure)', p)
+    if m: out["bars"] = int(m.group(1))
     m = re.search(r'(\d{2,3})\s*bpm', p)
-    if m: params["bpm"] = int(m.group(1))
-
+    if m: out["bpm"] = int(m.group(1))
     m = re.search(r'\b([A-Ga-g][#b]?\s*(?:major|minor|maj|min)?)\b', prompt)
-    if m: params["key"] = m.group(1).strip()
-
-    if not params["bpm"]:
+    if m: out["key"] = m.group(1).strip()
+    if not out["bpm"]:
         for words, bpm, label in [
             (["very slow","largo"],                        50, "very slow"),
             (["slow","adagio","gentle","relaxed","chill"], 75, "slow"),
@@ -118,11 +185,8 @@ def _parse_params(prompt):
             (["very fast","presto","intense"],            165, "very fast"),
         ]:
             if any(w in p for w in words):
-                params["bpm"] = bpm
-                params["tempo_word"] = label
-                break
-
-    return params
+                out["bpm"] = bpm; out["tempo_word"] = label; break
+    return out
 
 
 def _build_prompt(user_prompt, params):
@@ -131,96 +195,16 @@ def _build_prompt(user_prompt, params):
     if params.get("key"):        parts.append(params["key"])
     if params.get("tempo_word"): parts.append(params["tempo_word"])
     parts.append(user_prompt.strip())
+    # Always add looping/seamless hint for better loop output
+    if not any(w in user_prompt.lower() for w in ["loop", "seamless", "repeat"]):
+        parts.append("seamless loop")
     return ", ".join(parts)
 
 
 def _calc_duration(params):
     bars = params.get("bars")
     bpm  = params.get("bpm") or 120
-    if bars:
-        return bars * 4 * (60.0 / bpm)
-    return 30.0
-
-
-def _audio_to_midi(wav_bytes, bpm=120):
-    """
-    Transcribe WAV to MIDI using librosa pitch tracking + pretty_midi.
-    No TensorFlow dependency. Works best on single-instrument audio.
-    """
-    try:
-        import librosa
-        import pretty_midi
-        import numpy as np
-        import soundfile as sf
-        import io as _io
-
-        # Load audio
-        audio, sr = sf.read(_io.BytesIO(wav_bytes))
-        if audio.ndim == 2:
-            audio = audio.mean(axis=1)
-        audio = audio.astype(np.float32)
-
-        # Pitch tracking via pYIN (librosa) - good for melodic content
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            audio, sr=sr,
-            fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7"),
-            frame_length=2048,
-        )
-
-        # Convert f0 to MIDI notes
-        times = librosa.times_like(f0, sr=sr, hop_length=512)
-        midi = pretty_midi.PrettyMIDI(initial_tempo=float(bpm))
-        instrument = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
-
-        # Merge consecutive voiced frames into notes
-        note_start = None
-        note_pitch = None
-        for i, (t, freq, voiced) in enumerate(zip(times, f0, voiced_flag)):
-            if voiced and freq is not None and not np.isnan(freq):
-                pitch = int(round(librosa.hz_to_midi(freq)))
-                pitch = max(0, min(127, pitch))
-                if note_pitch is None:
-                    note_start = t
-                    note_pitch = pitch
-                elif abs(pitch - note_pitch) > 1:
-                    # Pitch changed - end previous note
-                    if note_start is not None and t - note_start > 0.05:
-                        note = pretty_midi.Note(
-                            velocity=80, pitch=note_pitch,
-                            start=note_start, end=t
-                        )
-                        instrument.notes.append(note)
-                    note_start = t
-                    note_pitch = pitch
-            else:
-                if note_start is not None and note_pitch is not None:
-                    end_t = t
-                    if end_t - note_start > 0.05:
-                        note = pretty_midi.Note(
-                            velocity=80, pitch=note_pitch,
-                            start=note_start, end=end_t
-                        )
-                        instrument.notes.append(note)
-                note_start = None
-                note_pitch = None
-
-        if not instrument.notes:
-            print("[WARN] audio_to_midi: no notes detected via pYIN", flush=True)
-            return None
-
-        midi.instruments.append(instrument)
-        buf = _io.BytesIO()
-        midi.write(buf)
-        print(f"[GEN] MIDI: {len(instrument.notes)} notes transcribed", flush=True)
-        return buf.getvalue()
-
-    except ImportError as e:
-        print(f"[WARN] audio_to_midi missing dep: {e}", flush=True)
-        return None
-    except Exception as e:
-        print(f"[WARN] audio_to_midi failed: {e}", flush=True)
-        return None
+    return bars * 4 * (60.0 / bpm) if bars else 15.0
 
 
 def _analyse_wav(wav_bytes):
@@ -236,12 +220,11 @@ def _analyse_wav(wav_bytes):
         names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
         maj = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88]
         mnr = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
-        import numpy as np
-        maj, mnr = np.array(maj), np.array(mnr)
+        import numpy as _np
         best = (None, -1.0)
         for s in range(12):
             for mode, prof in (("major", maj), ("minor", mnr)):
-                score = float(np.corrcoef(np.roll(prof, s), chroma)[0,1])
+                score = float(_np.corrcoef(_np.roll(prof, s), chroma)[0,1])
                 if score > best[1]: best = (f"{names[s]} {mode}", score)
         result["key"] = best[0] or ""
     except Exception:
@@ -250,49 +233,113 @@ def _analyse_wav(wav_bytes):
 
 
 def _generate(prompt, duration=None, guidance_scale=7.0):
-    params = _parse_params(prompt)
-    audio_prompt = _build_prompt(prompt, params)
-    bpm = params.get("bpm") or 120
+    # Wait for any in-progress DiT operations to complete
+    if not _DIT_READY.wait(timeout=120):
+        raise RuntimeError("DiT model not ready (reload timed out)")
+
+    # Clear CUDA cache to free fragmented memory before generation
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+        print(f"[GEN] VRAM free before generation: {free_gb:.2f}GB", flush=True)
+    except Exception:
+        pass
+
+    # Reload DiT to GPU if it was offloaded after previous VAE decode
+    try:
+        import torch
+        if _PIPELINE is not None:
+            for attr in ('model', 'dit_model', 'dit', 'transformer', 'unet'):
+                if hasattr(_PIPELINE, attr):
+                    obj = getattr(_PIPELINE, attr)
+                    if hasattr(obj, 'parameters'):
+                        # Check if already on GPU
+                        try:
+                            p = next(obj.parameters())
+                            if p.device.type == 'cpu':
+                                print(f"[GEN] Reloading {attr} to GPU for generation...", flush=True)
+                                obj.to(_DEVICE)
+                                torch.cuda.empty_cache()
+                                print(f"[GEN] {attr} reloaded to GPU", flush=True)
+                        except StopIteration:
+                            pass
+                        break
+    except Exception as e:
+        print(f"[GEN] DiT reload check failed: {e}", flush=True)
+
+    parsed   = _parse_params(prompt)
+    caption  = _build_prompt(prompt, parsed)
+    bpm      = parsed.get("bpm") or 120
+    bars     = parsed.get("bars")
 
     if duration is None:
-        duration = _calc_duration(params)
-    duration = max(10.0, min(600.0, duration))
+        duration = _calc_duration(parsed)
+    duration = max(8.0, min(120.0, duration))
 
-    print(f"[GEN] prompt={audio_prompt[:120]} duration={duration:.1f}s", flush=True)
+    print(f"[GEN] caption={caption[:100]} duration={duration:.1f}s bpm={bpm}", flush=True)
 
-    result = _PIPELINE.generate(
-        prompt=audio_prompt,
+    import tempfile
+    from acestep.inference import GenerationParams, GenerationConfig, generate_music
+
+    gen_params = GenerationParams(
+        caption=caption,
+        lyrics="[inst]",
         duration=duration,
         guidance_scale=guidance_scale,
-        num_inference_steps=60,
+        inference_steps=8,
     )
+    gen_config = GenerationConfig(batch_size=1, audio_format="wav")
 
-    # Normalise pipeline output to wav_bytes
-    if isinstance(result, bytes):
-        wav_bytes = result
-    elif hasattr(result, "audio"):
-        import soundfile as sf
-        buf = io.BytesIO()
-        audio = result.audio
-        sr = getattr(result, "sample_rate", 44100)
-        sf.write(buf, audio, sr, format="WAV")
-        wav_bytes = buf.getvalue()
-    elif isinstance(result, (str, Path)):
-        wav_bytes = Path(result).read_bytes()
-    else:
-        raise RuntimeError(f"Unknown pipeline output: {type(result)}")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = generate_music(_PIPELINE, None, gen_params, gen_config, save_dir=tmp_dir)
+        print(f"[GEN] result type={type(result)}", flush=True)
+
+        if isinstance(result, list):
+            result = result[0] if result else None
+        if result is None:
+            raise RuntimeError("generate_music returned no results")
+
+        wav_bytes = None
+        if hasattr(result, "success") and hasattr(result, "audios"):
+            if not result.success:
+                raise RuntimeError(f"Generation failed: {getattr(result, 'error', result.status_message)}")
+            if result.audios:
+                audio_info = result.audios[0]
+                audio_path = audio_info.get("path") if isinstance(audio_info, dict) else getattr(audio_info, "path", None)
+                if audio_path and os.path.exists(str(audio_path)):
+                    wav_bytes = open(str(audio_path), "rb").read()
+
+        if wav_bytes is None:
+            for attr in ("audio_path", "path", "file"):
+                p = getattr(result, attr, None)
+                if p and os.path.exists(str(p)):
+                    wav_bytes = open(str(p), "rb").read()
+                    break
+
+        if wav_bytes is None:
+            wavs = list(Path(tmp_dir).glob("*.wav"))
+            if wavs: wav_bytes = wavs[0].read_bytes()
+
+        if not wav_bytes:
+            raise RuntimeError(f"Cannot extract audio from result: {dir(result)}")
 
     print(f"[GEN] wav={len(wav_bytes)} bytes", flush=True)
 
-    midi_bytes = _audio_to_midi(wav_bytes, bpm=bpm)
-    meta       = _analyse_wav(wav_bytes)
+    # Run analysis with timeout - don't block response if librosa hangs
+    midi_bytes = None
+    meta = {"key": "", "tempo": ""}
+    pool = __import__('concurrent.futures', fromlist=['ThreadPoolExecutor']).ThreadPoolExecutor(max_workers=1)
+    meta_future = pool.submit(_analyse_wav, wav_bytes)
+    try:
+        meta = meta_future.result(timeout=8)
+    except Exception as e:
+        print(f"[GEN] Analysis skipped: {e}", flush=True)
+    pool.shutdown(wait=False)
 
-    parts = []
-    if meta["key"]:    parts.append(f"key of {meta['key']}")
-    if meta["tempo"]:  parts.append(meta["tempo"])
-    if params["bars"]: parts.append(f"{params['bars']} bars")
-    summary = ("Generated: " + ", ".join(parts) + ".") if parts else \
-              "Generated. Drag stems into your DAW."
+    bars_str = f"{bars} bars" if bars else ""
+    parts = [p for p in [meta.get("key"), meta.get("tempo"), bars_str] if p]
+    summary = ("Generated: " + ", ".join(parts) + ".") if parts else "Generated. Drag into your DAW."
 
     return {"wav_bytes": wav_bytes, "midi_bytes": midi_bytes,
             "key": meta["key"], "tempo": meta["tempo"], "summary": summary}
@@ -312,7 +359,8 @@ def build_app():
     @app.get("/healthz")
     def healthz():
         return {"ready": _READY.is_set(), "error": _LOAD_ERROR,
-                "device": _DEVICE, "model": "ace-step-v1.5"}
+                "device": _DEVICE, "model": "ace-step-v1.5-turbo",
+                "dit_ready": _DIT_READY.is_set()}
 
     @app.post("/generate")
     def generate(req: GenReq):
@@ -322,19 +370,43 @@ def build_app():
             t0 = time.time()
             try:
                 r = _generate(req.prompt, req.duration, req.guidance_scale)
-            except Exception as e:
+            except BaseException as e:
                 tb = traceback.format_exc()
+                print(f"[GEN] EXCEPTION in _generate: {type(e).__name__}: {e}", flush=True)
                 print(tb, flush=True)
                 return {"success": False, "error": f"{type(e).__name__}: {e}"}
 
+            print(f"[GEN] _generate returned, wav_bytes={len(r.get('wav_bytes') or b'')}", flush=True)
+
+            out_dir = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "C:\\Temp"))) \
+                      / "AIMidiComposer" / "output"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                print(f"[GEN] Cannot create output dir: {e}", flush=True)
+                out_dir = Path(os.environ.get("TEMP", "C:\\Temp"))
+
+            wav_path = ""
+            midi_path = ""
+
+            if r["wav_bytes"]:
+                try:
+                    wf = out_dir / f"gen_{int(t0)}.wav"
+                    wf.write_bytes(r["wav_bytes"])
+                    wav_path = str(wf)
+                    print(f"[GEN] saved wav -> {wav_path} ({len(r['wav_bytes'])} bytes)", flush=True)
+                except Exception as e:
+                    print(f"[GEN] ERROR saving wav: {e}", flush=True)
+
+            print(f"[GEN] returning response: wav_path={wav_path}", flush=True)
             return {
-                "success":      True,
-                "wav_base64":   base64.b64encode(r["wav_bytes"]).decode(),
-                "midi_base64":  base64.b64encode(r["midi_bytes"]).decode() if r["midi_bytes"] else "",
-                "key":          r["key"],
-                "tempo":        r["tempo"],
-                "summary":      r["summary"],
-                "seconds":      round(time.time() - t0, 1),
+                "success":   True,
+                "wav_path":  wav_path,
+                "midi_path": midi_path,
+                "key":       r["key"],
+                "tempo":     r["tempo"],
+                "summary":   r["summary"],
+                "seconds":   round(time.time() - t0, 1),
             }
 
     @app.post("/shutdown")
